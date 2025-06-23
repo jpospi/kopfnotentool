@@ -1,0 +1,1 @@
+{% for schueler in schueler_liste %}{{ schueler.name }}{% if not schueler.ist_letzter %}[PAGE_BREAK]{% endif %}{% endfor %}

@@ -8,7 +8,11 @@ import os
 import json
 import shutil
 import tempfile
+import tempfile
 import zipfile
+import os.path
+import uuid
+import io
 import re
 import hashlib
 import pandas as pd
@@ -20,6 +24,13 @@ from docxtpl import DocxTemplate
 from docx import Document
 from docx.shared import Inches
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from zipfile import ZipFile
+
+# Ensure temp directory exists with proper permissions
+temp_dir = Path("temp")
+temp_dir.mkdir(exist_ok=True)
+if os.path.exists(temp_dir):
+    os.chmod(temp_dir, 0o755)  # Set proper permissions
 
 # Logging-Konfiguration
 logging.basicConfig(
@@ -33,30 +44,28 @@ logging.basicConfig(
 
 # Globale Konstanten
 FAECHER_MAPPING = {
-    "Deu": "Deutsch",
-    "Mat": "Mathematik",
-    "Eng": "Englisch",
-    "Eth": "Ethik",
-    "Ges": "Geschichte",
-    "Kun": "Kunst",
-    "Mus": "Musik",
-    "Nawi": "Naturwissenschaften",
-    "Spo": "Sport",
-    "Inf": "Informatik",
-    "Phy": "Physik",
-    "Che": "Chemie",
-    "Bio": "Biologie",
+    "De": "Deutsch",
+    "Ma": "Mathematik",
+    "En": "Englisch",
+    "Et": "Ethik",
+    "Ge": "Geschichte",
+    "Ku": "Kunst",
+    "Mu": "Musik",
+    "Na": "Naturwissenschaften",
+    "Sp": "Sport",
+    "In": "Informatik",
+    "Ph": "Physik",
+    "Ch": "Chemie",
+    "Bi": "Biologie",
     "Gl": "Gesellschaftskunde",
-    "Fra": "Französisch",
-    "Spa": "Spanisch",
+    "Fr": "Französisch",
+    "Es": "Spanisch",
     "Al": "Arbeitslehre",
-    "Rel": "Religion",
+    "Re": "Religion",
 }
-
 
 class LinuxPathManager:
     """Linux-spezifische Pfad-Verwaltung"""
-
     @staticmethod
     def ensure_directory(path: Path) -> Path:
         """Erstellt Verzeichnis mit korrekten Linux-Berechtigungen"""
@@ -78,7 +87,6 @@ class LinuxPathManager:
         file_path = Path(file_path)
         if not file_path.exists():
             return False
-
         try:
             with open(file_path, "rb") as f:
                 f.read(1)
@@ -89,10 +97,8 @@ class LinuxPathManager:
         except Exception:
             return False
 
-
 class SimpleTemplateDesigner:
     """Vereinfachter Template-Designer ohne komplexe Validierung"""
-
     def __init__(self, parent):
         self.parent = parent
         self.logger = logging.getLogger("template_designer")
@@ -106,7 +112,6 @@ class SimpleTemplateDesigner:
         # Header
         header_frame = ttk.Frame(designer_window)
         header_frame.pack(fill=tk.X, padx=10, pady=5)
-
         ttk.Label(
             header_frame, text="Template-Designer", font=("Arial", 16, "bold")
         ).pack(anchor=tk.W)
@@ -123,9 +128,7 @@ class SimpleTemplateDesigner:
         # Template-Typ Auswahl
         type_frame = ttk.Frame(options_frame)
         type_frame.pack(fill=tk.X, padx=5, pady=5)
-
         ttk.Label(type_frame, text="Template-Typ:").pack(side=tk.LEFT)
-
         template_type = tk.StringVar(value="horizontal")
         ttk.Radiobutton(
             type_frame,
@@ -137,7 +140,6 @@ class SimpleTemplateDesigner:
         # Spaltenanzahl
         cols_frame = ttk.Frame(options_frame)
         cols_frame.pack(fill=tk.X, padx=5, pady=5)
-
         ttk.Label(cols_frame, text="Max. Spalten:").pack(side=tk.LEFT)
         max_cols = tk.StringVar(value="15")
         ttk.Spinbox(cols_frame, from_=10, to=20, textvariable=max_cols, width=5).pack(
@@ -147,7 +149,6 @@ class SimpleTemplateDesigner:
         # Vorschau
         preview_frame = ttk.LabelFrame(designer_window, text="Vorschau")
         preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
         preview_text = scrolledtext.ScrolledText(
             preview_frame, height=20, font=("Courier", 10)
         )
@@ -164,7 +165,6 @@ class SimpleTemplateDesigner:
         # Buttons
         button_frame = ttk.Frame(designer_window)
         button_frame.pack(fill=tk.X, padx=10, pady=5)
-
         ttk.Button(
             button_frame, text="Vorschau aktualisieren", command=update_preview
         ).pack(side=tk.LEFT, padx=5)
@@ -187,6 +187,7 @@ class SimpleTemplateDesigner:
         if template_type == "horizontal":
             content = (
                 """KOPFNOTEN - KLASSE {{klasse}}
+
 Export-Datum: {{export_datum}}
 
 Horizontale Tabelle (3 Zeilen × dynamische Spaltenanzahl):
@@ -194,9 +195,11 @@ Horizontale Tabelle (3 Zeilen × dynamische Spaltenanzahl):
 {% for schueler in schueler_liste %}
 Schüler: {{schueler.name}}
 
-Fach:     {% for fach in schueler.faecher_spalten %}{{fach}}{% if not loop.last %} | {% endif %}{% endfor %}
-AV-Note:  {% for note in schueler.av_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
-SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
+Fach: {% for fach in schueler.faecher_spalten %}{{fach}}{% if not loop.last %} | {% endif %}{% endfor %}
+
+AV-Note: {% for note in schueler.av_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
+
+SV-Note: {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
 
 {% if not schueler.ist_letzter %}---{% endif %}
 {% endfor %}
@@ -204,6 +207,7 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
             )
         else:
             content = """KOPFNOTEN - KLASSE {{klasse}}
+
 Export-Datum: {{export_datum}}
 
 Horizontale Tabelle (3 Zeilen × dynamische Spaltenanzahl):
@@ -211,9 +215,11 @@ Horizontale Tabelle (3 Zeilen × dynamische Spaltenanzahl):
 {% for schueler in schueler_liste %}
 Schüler: {{schueler.name}}
 
-Fach:     {% for fach in schueler.faecher_spalten %}{{fach}}{% if not loop.last %} | {% endif %}{% endfor %}
-AV-Note:  {% for note in schueler.av_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
-SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
+Fach: {% for fach in schueler.faecher_spalten %}{{fach}}{% if not loop.last %} | {% endif %}{% endfor %}
+
+AV-Note: {% for note in schueler.av_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
+
+SV-Note: {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% endif %}{% endfor %}
 
 {% if not schueler.ist_letzter %}---{% endif %}
 {% endfor %}
@@ -222,112 +228,102 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
 
     @staticmethod
     def create_working_horizontal_template(filename: str, max_cols: int = 15):
-        """Erstellt funktionierendes horizontales Template für DocxTemplate mit optimaler Spaltenbreite
-        und dynamischer Anpassung an die tatsächliche Anzahl der Fächer"""
+        """Creates a working horizontal template with proper Jinja nesting"""
         try:
             from docxtpl import DocxTemplate
             from docx import Document
-            from docx.shared import Pt, Inches
+            from docx.shared import Inches
             from docx.enum.table import WD_TABLE_ALIGNMENT
+            from tkinter import messagebox
+            from pathlib import Path
+            from docx.oxml.parser import parse_xml
+            import logging
 
-            # Neue DOCX-Datei erstellen
+            # Create new document
             doc = Document()
 
-            # Titel
-            title = doc.add_heading()
-            title_run = title.add_run("KOPFNOTEN - KLASSE ")
-            title_run.bold = True
-            # Template-Variable für Klasse
-            title.add_run("{{ klasse }}")
-
-            # Export-Datum
+            # Header section (outside any loops)
+            header_para = doc.add_paragraph()
+            header_para.add_run("KOPFNOTEN - KLASSE {{ klasse }}")
+            
             date_para = doc.add_paragraph()
-            date_para.add_run("Export-Datum: ")
-            date_para.add_run("{{ export_datum }}")
+            date_para.add_run("Export-Datum: {{ export_datum }}")
+            
+            doc.add_paragraph()  # Empty line for spacing
 
-            # Leerzeile
+            # FOR loop opening - in its own paragraph
+            for_para = doc.add_paragraph()
+            for_para.add_run("{% for schueler in schueler_liste %}")
+
+            # Student name heading - in its own paragraph
+            name_para = doc.add_paragraph()
+            name_para.add_run("{{ schueler.name }}")
+            doc.add_paragraph()  # Spacing before table
+
+            # Create table with fixed column widths
+            table = doc.add_table(rows=3, cols=max_cols + 1)
+            table.style = 'Table Grid'
+            table.autofit = False
+
+            # Set header column width (1 inch)
+            table.columns[0].width = Inches(1).emu
+
+            # Calculate and set data column widths (remaining space divided equally)
+            if max_cols > 0:
+                data_col_width = Inches(7).emu // max_cols  # 7 inches divided among data columns
+                for i in range(1, max_cols + 1):
+                    table.columns[i].width = data_col_width
+
+            # Headers
+            headers = ["Fach", "AV", "SV"]
+            for i, header in enumerate(headers):
+                cell = table.cell(i, 0)
+                run = cell.paragraphs[0].add_run(header)
+                run.bold = True
+
+            # Data cells with Jinja templating
+            for i in range(max_cols):
+                # Subject names
+                cell = table.cell(0, i + 1)
+                cell.text = "{{ schueler.faecher_spalten[" + str(i) + "] if schueler.faecher_spalten|length > " + str(i) + " else '' }}"
+                
+                # AV grades
+                cell = table.cell(1, i + 1)
+                cell.text = "{{ schueler.av_noten[" + str(i) + "] if schueler.av_noten|length > " + str(i) + " else '' }}"
+                
+                # SV grades
+                cell = table.cell(2, i + 1)
+                cell.text = "{{ schueler.sv_noten[" + str(i) + "] if schueler.sv_noten|length > " + str(i) + " else '' }}"
+
+            # Add spacing after table
             doc.add_paragraph()
 
-            # Schüler-Schleife
-            doc.add_paragraph("{% for schueler in schueler_liste %}")
+            # Page break control - in separate paragraphs
+            # First the if statement
+            if_para = doc.add_paragraph()
+            if_para.add_run("{% if not schueler.ist_letzter %}")
 
-            # Schüler-Name als Überschrift
-            doc.add_heading("{{ schueler.name }}", level=2)
+            # Then the page break in its own paragraph
+            break_para = doc.add_paragraph()
+            break_run = break_para.add_run()
+            break_run._r.append(parse_xml(r'<w:br w:type="page"/>'))
 
-            # Dynamische Tabelle mit 3 Zeilen erstellen
-            # Die Spaltenanzahl wird auf max_cols begrenzt, aber die Breite wird optimal verteilt
-            table = doc.add_table(rows=3, cols=max_cols + 1)
-            table.style = "Table Grid"
+            # Close the if block
+            endif_para = doc.add_paragraph()
+            endif_para.add_run("{% endif %}")
 
-            # WICHTIG: Deaktiviere automatische Anpassung für volle Kontrolle über Spaltenbreite
-            table.autofit = False
-            table.allow_autofit = False
+            # Add spacing before endfor
+            doc.add_paragraph()
 
-            # Erste Spalte für Bezeichnungen
-            bezeichnungen = ["Fach", "AV", "SV"]
-            for i, bezeichnung in enumerate(bezeichnungen):
-                cell = table.cell(i, 0)
-                cell.text = bezeichnung
-                # Formatierung fett
-                for paragraph in cell.paragraphs:
-                    for run in paragraph.runs:
-                        run.bold = True
+            # Close the for loop - in its own paragraph
+            endfor_para = doc.add_paragraph()
+            endfor_para.add_run("{% endfor %}")
 
-            # Zeile 1: Fach-Namen (mit Fallback für leere Spalten)
-            for i in range(max_cols):
-                cell = table.cell(0, i + 1)  # +1 wegen Beschriftungsspalte
-                # Index-basierte Zugriffe mit sicherem Fallback
-                cell.text = f'{{{{ schueler.faecher_spalten[{i}] if schueler.faecher_spalten|length > {i} else "" }}}}'
-
-            # Zeile 2: AV-Noten
-            for i in range(max_cols):
-                cell = table.cell(1, i + 1)  # +1 wegen Beschriftungsspalte
-                cell.text = f'{{{{ schueler.av_noten[{i}] if schueler.av_noten|length > {i} else "" }}}}'
-
-            # Zeile 3: SV-Noten
-            for i in range(max_cols):
-                cell = table.cell(2, i + 1)  # +1 wegen Beschriftungsspalte
-                cell.text = f'{{{{ schueler.sv_noten[{i}] if schueler.sv_noten|length > {i} else "" }}}}'
-
-            # OPTIMIERTE SPALTENBREITENVERTEILUNG
-            # Berechnung der optimalen Spaltenbreiten basierend auf verfügbarem Platz
-
-            # Standard-Seitengeometrie (Letter-Format)
-            seitenbreite_total = Inches(8.5)  # Standard Letter-Breite
-            linker_rand = Inches(1.0)  # Linker Rand
-            rechter_rand = Inches(1.0)  # Rechter Rand
-            verfuegbare_breite = seitenbreite_total - linker_rand - rechter_rand  # = 6.5 Inches
-
-            # Beschriftungsspalte bekommt feste, optimale Breite
-            beschriftung_breite = Inches(1.0)
-
-            # Verbleibende Breite für Fächerspalten
-            faecher_breite_total = verfuegbare_breite - beschriftung_breite  # = 5.5 Inches
-
-            # Breite pro Fächerspalte (gleichmäßig verteilt)
-            fach_spalten_breite = faecher_breite_total / max_cols
-
-            # Setze Spaltenbreiten
-            for i in range(table.columns.__len__()):
-                if i == 0:
-                    # Beschriftungsspalte: feste optimale Breite
-                    table.columns[i].width = beschriftung_breite
-                else:
-                    # Fächerspalten: gleichmäßig verteilte Breite
-                    table.columns[i].width = fach_spalten_breite
-
-            # Seitenumbruch zwischen Schülern (außer beim letzten)
-            doc.add_paragraph("{% if not loop.last %}")
-            doc.add_page_break()
-            doc.add_paragraph("{% endif %}")
-
-            # Ende der Schüler-Schleife
-            doc.add_paragraph("{% endfor %}")
-
-            # Datei speichern
+            # Save template
             doc.save(filename)
 
-            # Note: This function is called statically, so messagebox calls are standalone
+            # Success message
+            cols_width_display = 7.0 / max_cols if max_cols > 0 else 0
             messagebox.showinfo(
                 "Template erstellt",
                 f"Template erfolgreich erstellt:\n"
@@ -335,7 +331,7 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
                 f"Typ: horizontal mit optimaler Spaltenbreite\n"
                 f"Max. Spalten: {max_cols}\n"
                 f"Beschriftungsbreite: 1.0''\n"
-                f"Fächerspaltenbreite: {round(fach_spalten_breite.inches, 2)}'' pro Spalte"
+                f"Fächerspaltenbreite: {cols_width_display:.2f}'' pro Spalte"
             )
 
         except Exception as e:
@@ -345,7 +341,7 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
     def create_template_file(self, template_type: str, max_cols: int, parent_window):
         """Erstellt Template-Datei über Dialog"""
         try:
-            # Dateiname abfragen
+            # Get filename
             filename = filedialog.asksaveasfilename(
                 title="Template speichern",
                 defaultextension=".docx",
@@ -356,10 +352,19 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
             if not filename:
                 return
 
-            # Template erstellen
+            # Create template
             if template_type == "horizontal":
-                self.create_working_horizontal_template(filename, max_cols)
-                parent_window.destroy()
+                # Create temporary directory for template creation
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir) / Path(filename).name
+                    
+                    # Create template
+                    self.create_working_horizontal_template(str(temp_path), max_cols)
+                    
+                    # If template was created successfully, copy it to final location
+                    if temp_path.exists():
+                        shutil.copy2(temp_path, filename)
+                        parent_window.destroy()
             else:
                 messagebox.showinfo(
                     "Info", "Vertikale Templates werden nicht unterstützt."
@@ -369,10 +374,8 @@ SV-Note:  {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {%
             self.logger.error(f"Fehler beim Erstellen der Template-Datei: {e}")
             messagebox.showerror("Template-Fehler", f"Fehler: {e}")
 
-
 class KopfnotenImporter:
     """Import-Klasse für Excel-Dateien"""
-
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
         self.conn = None
@@ -392,7 +395,6 @@ class KopfnotenImporter:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA foreign_keys = ON")
-
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS schueler (
@@ -402,7 +404,7 @@ class KopfnotenImporter:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(name, klasse)
             );
-            
+
             CREATE TABLE IF NOT EXISTS faecher (
                 fach_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 fach_kurz TEXT NOT NULL,
@@ -412,7 +414,7 @@ class KopfnotenImporter:
                 wahlpflicht_gruppe TEXT,
                 UNIQUE(fach_kurz, fach_typ, wahlpflicht_gruppe)
             );
-            
+
             CREATE TABLE IF NOT EXISTS noten (
                 noten_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 schueler_id INTEGER NOT NULL,
@@ -427,12 +429,11 @@ class KopfnotenImporter:
                 FOREIGN KEY (fach_id) REFERENCES faecher(fach_id),
                 UNIQUE(schueler_id, fach_id, schuljahr, halbjahr)
             );
-            
+
             CREATE INDEX IF NOT EXISTS idx_schueler_klasse ON schueler(klasse);
             CREATE INDEX IF NOT EXISTS idx_noten_schueler ON noten(schueler_id);
-        """
+            """
         )
-
         conn.commit()
         return conn
 
@@ -446,6 +447,7 @@ class KopfnotenImporter:
 
         if note_str.startswith("-"):
             return None, ist_wahlpflicht
+
         if "GB" in note_str.upper():
             return None, ist_wahlpflicht
 
@@ -509,20 +511,20 @@ class KopfnotenImporter:
             fach_kurz = fach_clean
 
         cursor = self.conn.execute(
-            """SELECT fach_id FROM faecher 
-               WHERE fach_kurz = ? 
+            """SELECT fach_id FROM faecher
+               WHERE fach_kurz = ?
                AND (fach_typ = ? OR (fach_typ IS NULL AND ? IS NULL))
                AND (wahlpflicht_gruppe = ? OR (wahlpflicht_gruppe IS NULL AND ? IS NULL))""",
             (fach_kurz, fach_typ, fach_typ, wahlpflicht_gruppe, wahlpflicht_gruppe),
         )
-        result = cursor.fetchone()
 
+        result = cursor.fetchone()
         if result:
             fach_id = result[0]
         else:
             fach_lang = FAECHER_MAPPING.get(fach_kurz, fach_kurz)
             cursor = self.conn.execute(
-                """INSERT INTO faecher (fach_kurz, fach_lang, fach_typ, ist_wahlpflicht, wahlpflicht_gruppe) 
+                """INSERT INTO faecher (fach_kurz, fach_lang, fach_typ, ist_wahlpflicht, wahlpflicht_gruppe)
                    VALUES (?, ?, ?, ?, ?)""",
                 (fach_kurz, fach_lang, fach_typ, ist_wahlpflicht, wahlpflicht_gruppe),
             )
@@ -537,8 +539,8 @@ class KopfnotenImporter:
             "SELECT schueler_id FROM schueler WHERE name = ? AND klasse = ?",
             (name, klasse),
         )
-        result = cursor.fetchone()
 
+        result = cursor.fetchone()
         if result:
             return result[0]
         else:
@@ -564,16 +566,14 @@ class KopfnotenImporter:
 
             meta_columns = ["Name", "Art", "KN", "Abstg."]
             fach_info = []
-
             for idx, col in enumerate(df.columns):
                 if col not in meta_columns and pd.notna(col):
                     fach_info.append((idx, col))
 
             fach_columns_clean = []
             rel_count = 0
-
             for idx, col_name in fach_info:
-                if col_name == "Rel":
+                if col_name == "Re":
                     rel_count += 1
                     if rel_count == 1:
                         fach_columns_clean.append((idx, col_name, "evangelisch"))
@@ -583,7 +583,6 @@ class KopfnotenImporter:
                     fach_columns_clean.append((idx, col_name, None))
 
             schueler_noten = {}
-
             for row_idx, row in df.iterrows():
                 name = row.iloc[df.columns.get_loc("Name")]
                 art = row.iloc[df.columns.get_loc("Art")]
@@ -633,16 +632,16 @@ class KopfnotenImporter:
                         or ist_wahlpflicht_belegung
                     ):
                         cursor = self.conn.execute(
-                            """SELECT noten_id FROM noten 
-                               WHERE schueler_id = ? AND fach_id = ? 
+                            """SELECT noten_id FROM noten
+                               WHERE schueler_id = ? AND fach_id = ?
                                AND schuljahr = '2024/2025' AND halbjahr = 1""",
                             (schueler_id, fach_id),
                         )
-                        existing = cursor.fetchone()
 
+                        existing = cursor.fetchone()
                         if existing:
                             self.conn.execute(
-                                """UPDATE noten 
+                                """UPDATE noten
                                    SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?
                                    WHERE noten_id = ?""",
                                 (
@@ -654,8 +653,8 @@ class KopfnotenImporter:
                             )
                         else:
                             self.conn.execute(
-                                """INSERT INTO noten 
-                                   (schueler_id, fach_id, note_av, note_sv, ist_wahlpflicht_belegung) 
+                                """INSERT INTO noten
+                                   (schueler_id, fach_id, note_av, note_sv, ist_wahlpflicht_belegung)
                                    VALUES (?, ?, ?, ?, ?)""",
                                 (
                                     schueler_id,
@@ -677,7 +676,6 @@ class KopfnotenImporter:
             self.conn.rollback()
             raise
 
-
 class OptimizedKopfnotenExporter:
     """Optimierter Exporter für horizontale 3-Zeilen-Tabellen mit korrekter erster Spalte"""
 
@@ -697,24 +695,167 @@ class OptimizedKopfnotenExporter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             self.conn.close()
+            
+    def _create_test_template(self, doc: Document, max_cols: int) -> None:
+        """Creates a test template with proper Jinja nesting
+        
+        Args:
+            doc: Document object to add template content to
+            max_cols: Maximum number of columns for the table
+        """
+        # Import necessary modules for XML handling
+        from docx.oxml.xmlchemy import OxmlElement
+        from docx.oxml.ns import qn
+        
+        # Title and date (outside any control blocks)
+        header_para = doc.add_paragraph()
+        header_para.add_run("KOPFNOTEN - KLASSE {{ klasse }}")
+        
+        date_para = doc.add_paragraph()
+        date_para.add_run("Export-Datum: {{ export_datum }}")
+        
+        doc.add_paragraph()  # Empty line for spacing
+
+        # FOR loop opening - in its own paragraph
+        for_para = doc.add_paragraph()
+        for_para.add_run("{% for schueler in schueler_liste %}")
+
+        # Student name heading
+        name_para = doc.add_paragraph()
+        name_para.add_run("{{ schueler.name }}")
+        
+        doc.add_paragraph()  # Add spacing before table
+
+        # Create table
+        table = doc.add_table(rows=3, cols=max_cols + 1)
+        table.style = "Table Grid"
+        table.autofit = False
+
+        # Headers
+        headers = ["Fach", "AV", "SV"]
+        for i, header in enumerate(headers):
+            cell = table.cell(i, 0)
+            run = cell.paragraphs[0].add_run(header)
+            run.bold = True
+
+        # Data cells
+        for i in range(max_cols):
+            # Subject names
+            cell = table.cell(0, i + 1)
+            cell.text = "{{ schueler.faecher_spalten[" + str(i) + "] if schueler.faecher_spalten|length > " + str(i) + " else '' }}"
+            
+            # AV grades
+            cell = table.cell(1, i + 1)
+            cell.text = "{{ schueler.av_noten[" + str(i) + "] if schueler.av_noten|length > " + str(i) + " else '' }}"
+            
+            # SV grades
+            cell = table.cell(2, i + 1)
+            cell.text = "{{ schueler.sv_noten[" + str(i) + "] if schueler.sv_noten|length > " + str(i) + " else '' }}"
+
+        # Set column widths as integers
+        table.columns[0].width = int(1000000)  # About 1 inch in EMUs
+        if max_cols > 0:
+            data_col_width = int(7000000 // max_cols)  # About 7 inches total divided by columns
+            for i in range(1, max_cols + 1):
+                table.columns[i].width = data_col_width
+
+        # Add spacing after table
+        doc.add_paragraph()
+
+        # Add a paragraph for the conditional page break with proper XML break tag
+        if_para = doc.add_paragraph()
+        if_para.add_run("{% if not schueler.ist_letzter %}")
+        
+        # Add a page break using proper XML element creation
+        page_break_para = doc.add_paragraph()
+        run = page_break_para.add_run()
+        br = OxmlElement('w:br')
+        br.set(qn('w:type'), 'page')
+        run._r.append(br)
+        
+        # ENDIF statement - in its own paragraph
+        endif_para = doc.add_paragraph()
+        endif_para.add_run("{% endif %}")
+        
+        # Add spacing before endfor
+        doc.add_paragraph()
+        
+        # ENDFOR statement - in its own paragraph
+        endfor_para = doc.add_paragraph()
+        endfor_para.add_run("{% endfor %}")
+
+    def _process_template_with_context(self, template_path: Path, context: Dict[str, Any], output_file: Path) -> None:
+        """Process a template with proper nesting of Jinja control structures
+        
+        Args:
+            template_path: Path to the template file
+            context: Context data for template rendering
+            output_file: Path where to save the output file
+        """
+        original_cwd = os.getcwd()
+        temp_dir = None
+        
+        try:
+            # Create temporary directory
+            temp_dir = Path(tempfile.mkdtemp())
+            self.logger.info(f"Created temp directory: {temp_dir}")
+            
+            # Copy template to temp directory
+            temp_template = temp_dir / template_path.name
+            shutil.copy2(template_path, temp_template)
+            self.logger.info(f"Template copied to temp directory, size: {temp_template.stat().st_size} bytes")
+            
+            # Change to temp directory
+            os.chdir(temp_dir)
+            self.logger.info(f"Changed working directory to: {temp_dir}")
+            
+            # Generate template filename with timestamp to avoid conflicts
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_docxtpl = f"temp_template_{timestamp}.docx"
+            
+            # Process with DocxTemplate - using the existing template
+            template = DocxTemplate(str(temp_template))
+            self.logger.info(f"DocxTemplate initialized with: {temp_docxtpl}")
+            
+            # Render template with context
+            template.render(context)
+            
+            # Change back to original directory before saving
+            os.chdir(original_cwd)
+            self.logger.info(f"Changed back to original directory (cleanup): {original_cwd}")
+            
+            # Save output
+            template.save(str(output_file))
+            self.logger.info(f"Output saved to: {output_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error processing template: {e}")
+            raise
+            
+        finally:
+            # Clean up
+            try:
+                if original_cwd:
+                    os.chdir(original_cwd)
+                if temp_dir and temp_dir.exists():
+                    shutil.rmtree(temp_dir)
+                    self.logger.info("Temporäre Dateien bereinigt")
+            except Exception as cleanup_error:
+                self.logger.warning(f"Warning during cleanup: {cleanup_error}")
 
     def export_horizontal_tables(
         self, output_dir: Path, template_path: Path, klassen_liste: List[str], schueler_id: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Exportiert horizontale 3-Zeilen-Tabellen für ausgewählte Klassen oder einen einzelnen Schüler
-
-        Args:
-            output_dir (Path): Ausgabeverzeichnis
-            template_path (Path): Template-Pfad
-            klassen_liste (List[str]): Liste der Klassen zum Exportieren
-            schueler_id (Optional[int]): Optionale ID eines einzelnen Schülers
-
-        Returns:
-            Dict[str, Any]: Export-Ergebnis
-        """
+        """Exportiert horizontale 3-Zeilen-Tabellen für ausgewählte Klassen oder einen einzelnen Schüler"""
         output_dir = Path(output_dir)
-        template_path = Path(template_path)
-
+        template_path = Path(template_path).resolve()
+        if not template_path.exists():
+            raise FileNotFoundError(f"Template nicht gefunden: {template_path}")
+        
+        # Make sure template exists
+        if not template_path.exists():
+            raise FileNotFoundError(f"Template nicht gefunden: {template_path}")
+            
         output_dir.mkdir(parents=True, exist_ok=True)
 
         summary = {
@@ -730,36 +871,33 @@ class OptimizedKopfnotenExporter:
             # Wenn eine Schüler-ID angegeben ist, exportiere nur diesen Schüler
             if schueler_id is not None:
                 self.logger.info(f"Exportiere einzelnen Schüler: ID {schueler_id}")
-                
                 # Hole Schülerdaten
                 cursor = self.conn.execute(
-                    "SELECT name, klasse FROM schueler WHERE schueler_id = ?", 
+                    "SELECT name, klasse FROM schueler WHERE schueler_id = ?",
                     (schueler_id,)
                 )
                 schueler_data = cursor.fetchone()
-                
                 if not schueler_data:
                     raise ValueError(f"Schüler mit ID {schueler_id} nicht gefunden")
-                
+
                 schueler_name = schueler_data["name"]
                 klasse = schueler_data["klasse"]
-                
+
                 # Exportiere den einzelnen Schüler
                 schueler_result = self._export_einzelschueler_horizontal(
                     schueler_id, schueler_name, klasse, output_dir, template_path
                 )
-                
+
                 summary["schueler_details"][schueler_id] = schueler_result
                 if schueler_result["datei_erstellt"]:
                     summary["gesamt_dateien"] += 1
                 else:
                     summary["gesamt_fehler"] += 1
-            
+
             # Sonst exportiere alle ausgewählten Klassen
             else:
                 for klasse in klassen_liste:
                     self.logger.info(f"Exportiere Klasse horizontal: {klasse}")
-
                     klassen_result = self._export_klasse_horizontal_optimized(
                         klasse, output_dir, template_path
                     )
@@ -782,16 +920,7 @@ class OptimizedKopfnotenExporter:
     def _export_klasse_horizontal_optimized(
         self, klasse: str, output_dir: Path, template_path: Path
     ) -> Dict[str, Any]:
-        """Exportiert eine Klasse als horizontale Tabelle (optimiert)
-
-        Args:
-            klasse (str): Zu exportierende Klasse
-            output_dir (Path): Ausgabeverzeichnis
-            template_path (Path): Template-Pfad
-
-        Returns:
-            Dict[str, Any]: Export-Ergebnis
-        """
+        """Exportiert eine Klasse als horizontale Tabelle (optimiert)"""
         result = {
             "datei_erstellt": False,
             "output_file": None,
@@ -801,19 +930,15 @@ class OptimizedKopfnotenExporter:
         }
 
         try:
-            # Template laden
-            doc = DocxTemplate(str(template_path))
-
-            # Schüler-Daten sammeln
+            # Get class data
             schueler_liste = self._get_schueler_horizontal_optimized(klasse)
-
             if not schueler_liste:
                 raise ValueError(f"Keine Schüler in Klasse {klasse} gefunden")
 
-            # Maximalwert berechnen
+            # Calculate maximum subjects
             max_faecher = max(s["faecher_anzahl"] for s in schueler_liste)
 
-            # Context erstellen
+            # Create context
             context = {
                 "klasse": klasse,
                 "export_datum": datetime.now().strftime("%d.%m.%Y"),
@@ -822,28 +947,25 @@ class OptimizedKopfnotenExporter:
                 "schueler": schueler_liste[0] if schueler_liste else None,
             }
 
-            # Template verarbeiten
-            doc.render(context)
-
-            # Datei speichern
+            # Create output file path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f"Kopfnoten_{klasse}_horizontal_{timestamp}.docx"
-            doc.save(output_file)
+            output_file = output_dir.resolve() / f"Kopfnoten_{klasse}_horizontal_{timestamp}.docx"
 
-            # Ergebnis aktualisieren
-            result.update(
-                {
-                    "datei_erstellt": True,
-                    "output_file": str(output_file),
-                    "schueler_count": len(schueler_liste),
-                    "faecher_count": max_faecher,
-                }
-            )
+            # Process template
+            self._process_template_with_context(template_path, context, output_file)
+
+            # Update result
+            result.update({
+                "datei_erstellt": True,
+                "output_file": str(output_file),
+                "schueler_count": len(schueler_liste),
+                "faecher_count": max_faecher,
+            })
 
             self.logger.info(f"Erfolgreich exportiert: {output_file.name}")
 
         except Exception as e:
-            error_msg = f"Exportfehler {klasse}: {str(e)}"
+            error_msg = f"Export error {klasse}: {str(e)}"
             self.logger.error(error_msg)
             result["fehler"] = error_msg
 
@@ -852,18 +974,7 @@ class OptimizedKopfnotenExporter:
     def _export_einzelschueler_horizontal(
         self, schueler_id: int, schueler_name: str, klasse: str, output_dir: Path, template_path: Path
     ) -> Dict[str, Any]:
-        """Exportiert einen einzelnen Schüler als horizontale Tabelle
-
-        Args:
-            schueler_id (int): ID des zu exportierenden Schülers
-            schueler_name (str): Name des Schülers
-            klasse (str): Klasse des Schülers
-            output_dir (Path): Ausgabeverzeichnis
-            template_path (Path): Template-Pfad
-
-        Returns:
-            Dict[str, Any]: Export-Ergebnis
-        """
+        """Exportiert einen einzelnen Schüler als horizontale Tabelle"""
         result = {
             "datei_erstellt": False,
             "output_file": None,
@@ -872,48 +983,38 @@ class OptimizedKopfnotenExporter:
         }
 
         try:
-            # Template laden
-            doc = DocxTemplate(str(template_path))
-
-            # Schüler-Daten sammeln
+            # Get student data
             schueler_data = self._get_einzelschueler_horizontal(schueler_id, schueler_name, klasse)
-
             if not schueler_data:
-                raise ValueError(f"Keine Daten für Schüler {schueler_name} (ID: {schueler_id}) gefunden")
+                raise ValueError(f"No data found for student {schueler_name} (ID: {schueler_id})")
 
-            # Liste mit nur diesem Schüler erstellen
-            schueler_liste = [schueler_data]
-            
-            # Context erstellen
+            # Create context
             context = {
                 "klasse": klasse,
                 "export_datum": datetime.now().strftime("%d.%m.%Y"),
-                "schueler_liste": schueler_liste,
+                "schueler_liste": [schueler_data],
                 "max_faecher": schueler_data["faecher_anzahl"],
                 "schueler": schueler_data,
             }
 
-            # Template verarbeiten
-            doc.render(context)
-
-            # Datei speichern
+            # Create output file path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f"Kopfnoten_{schueler_name.replace(' ', '_')}_{timestamp}.docx"
-            doc.save(output_file)
+            output_file = output_dir.resolve() / f"Kopfnoten_{schueler_name.replace(' ', '_')}_{timestamp}.docx"
 
-            # Ergebnis aktualisieren
-            result.update(
-                {
-                    "datei_erstellt": True,
-                    "output_file": str(output_file),
-                    "faecher_count": schueler_data["faecher_anzahl"],
-                }
-            )
+            # Process template
+            self._process_template_with_context(template_path, context, output_file)
 
-            self.logger.info(f"Erfolgreich exportiert: {output_file.name}")
+            # Update result
+            result.update({
+                "datei_erstellt": True,
+                "output_file": str(output_file),
+                "faecher_count": schueler_data["faecher_anzahl"],
+            })
+
+            self.logger.info(f"Export successful: {output_file.name}")
 
         except Exception as e:
-            error_msg = f"Exportfehler für Schüler {schueler_name}: {str(e)}"
+            error_msg = f"Export error for student {schueler_name}: {str(e)}"
             self.logger.error(error_msg)
             result["fehler"] = error_msg
 
@@ -926,7 +1027,7 @@ class OptimizedKopfnotenExporter:
         # Fächer für diesen Schüler laden
         cursor = self.conn.execute(
             """
-            SELECT 
+            SELECT
                 f.fach_kurz,
                 n.note_av,
                 n.note_sv,
@@ -980,11 +1081,11 @@ class OptimizedKopfnotenExporter:
         """Sammelt Schülerdaten für optimierte horizontale Darstellung"""
         cursor = self.conn.execute(
             """
-            SELECT schueler_id, name 
-            FROM schueler 
-            WHERE klasse = ? 
+            SELECT schueler_id, name
+            FROM schueler
+            WHERE klasse = ?
             ORDER BY name
-        """,
+            """,
             (klasse,),
         )
 
@@ -998,7 +1099,7 @@ class OptimizedKopfnotenExporter:
             # Fächer für diesen Schüler laden
             cursor = self.conn.execute(
                 """
-                SELECT 
+                SELECT
                     f.fach_kurz,
                     n.note_av,
                     n.note_sv,
@@ -1008,7 +1109,7 @@ class OptimizedKopfnotenExporter:
                 JOIN faecher f ON n.fach_id = f.fach_id
                 WHERE n.schueler_id = ?
                 ORDER BY f.fach_lang
-            """,
+                """,
                 (schueler_id,),
             )
 
@@ -1050,10 +1151,8 @@ class OptimizedKopfnotenExporter:
 
         return schueler_liste
 
-
 class SimplifiedGradeEditor:
     """Vereinfachter Noten-Editor"""
-
     def __init__(self, parent, db_path: str):
         self.parent = parent
         self.db_path = db_path
@@ -1077,6 +1176,7 @@ class SimplifiedGradeEditor:
                 text=f"Schüler: {student_name}",
                 font=("Arial", 14, "bold"),
             ).pack(side=tk.LEFT)
+
             ttk.Label(
                 header_frame, text=f"Klasse: {student_class}", font=("Arial", 12)
             ).pack(side=tk.RIGHT)
@@ -1104,7 +1204,7 @@ class SimplifiedGradeEditor:
                 conn.row_factory = sqlite3.Row  # Für Spaltenzugriff per Name
                 cursor = conn.execute(
                     """
-                    SELECT 
+                    SELECT
                         n.noten_id,
                         f.fach_lang,
                         f.fach_kurz,
@@ -1116,11 +1216,12 @@ class SimplifiedGradeEditor:
                     JOIN faecher f ON n.fach_id = f.fach_id
                     WHERE n.schueler_id = ?
                     ORDER BY f.fach_lang
-                """,
+                    """,
                     (student_id,),
                 )
 
                 return [dict(row) for row in cursor.fetchall()]
+
         except Exception as e:
             self.logger.error(f"Fehler beim Laden der Noten: {e}")
             return []
@@ -1160,7 +1261,6 @@ class SimplifiedGradeEditor:
 
         # Eingabefelder für jedes Fach
         grade_vars = {}
-
         for i, grade in enumerate(grades_data, 1):
             row_frame = ttk.Frame(scrollable_frame)
             row_frame.pack(fill=tk.X, padx=5, pady=2)
@@ -1252,20 +1352,19 @@ class SimplifiedGradeEditor:
                         # Speichere in Datenbank
                         conn.execute(
                             """
-                            UPDATE noten 
+                            UPDATE noten
                             SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?
                             WHERE noten_id = ?
-                        """,
+                            """,
                             (av_value, sv_value, wp_value, noten_id),
                         )
-
                         saved_count += 1
 
                     conn.commit()
-
                     messagebox.showinfo(
                         "Gespeichert", f"{saved_count} Noten erfolgreich gespeichert!"
                     )
+
                     editor_window.destroy()
 
                     # Refresh parent window if possible
@@ -1279,14 +1378,13 @@ class SimplifiedGradeEditor:
         ttk.Button(
             button_frame, text="Alle Noten speichern", command=save_all_grades
         ).pack(side=tk.LEFT, padx=5)
+
         ttk.Button(button_frame, text="Abbrechen", command=editor_window.destroy).pack(
             side=tk.RIGHT, padx=5
         )
 
-
 class StatusManager:
     """Einfache Status-Verwaltung"""
-
     def __init__(self, parent):
         self.parent = parent
         self.status_label = None
@@ -1321,10 +1419,8 @@ class StatusManager:
         """Setzt Status zurück"""
         self.set_status("Bereit", False)
 
-
 class KopfnotenGUI:
     """Hauptklasse der optimierten GUI-Anwendung"""
-
     def __init__(self):
         self.root = tk.Tk()
         self.setup_application()
@@ -1358,10 +1454,9 @@ class KopfnotenGUI:
 
     def setup_application(self):
         """Grundlegende Anwendungseinrichtung"""
-        self.root.title("AES-Kopfnoten-Manager v2.0 - Optimiert")
+        self.root.title("Kopfnoten-Manager")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 700)
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # Style für bessere Optik
@@ -1461,9 +1556,11 @@ class KopfnotenGUI:
             text="Excel-Dateien auswählen",
             command=self.select_excel_files,
         ).pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(
             button_frame, text="Alle importieren", command=self.import_all_files
         ).pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(
             button_frame, text="Auswahl löschen", command=self.clear_import_selection
         ).pack(side=tk.LEFT)
@@ -1479,8 +1576,8 @@ class KopfnotenGUI:
         scrollbar_import = ttk.Scrollbar(
             listbox_frame, orient=tk.VERTICAL, command=self.import_listbox.yview
         )
-        self.import_listbox.config(yscrollcommand=scrollbar_import.set)
 
+        self.import_listbox.config(yscrollcommand=scrollbar_import.set)
         self.import_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar_import.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -1516,6 +1613,7 @@ class KopfnotenGUI:
         ttk.Button(filter_controls, text="Suchen", command=self.search_students).pack(
             side=tk.LEFT, padx=(0, 5)
         )
+
         ttk.Button(
             filter_controls, text="Filter zurücksetzen", command=self.reset_filters
         ).pack(side=tk.LEFT)
@@ -1553,13 +1651,15 @@ class KopfnotenGUI:
         ttk.Button(
             edit_frame, text="Noten bearbeiten", command=self.edit_selected_grade
         ).pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(
             edit_frame, text="Schüler löschen", command=self.delete_selected_student
         ).pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(
             edit_frame, text="Daten aktualisieren", command=self.refresh_analysis_data
         ).pack(side=tk.LEFT)
-        
+
         # Neue Schaltfläche für Einzelschüler-Export
         ttk.Button(
             edit_frame, text="Schüler exportieren", command=self.export_selected_student
@@ -1610,6 +1710,7 @@ class KopfnotenGUI:
         ttk.Button(
             class_controls, text="Alle auswählen", command=self.select_all_classes
         ).pack(side=tk.LEFT, padx=(0, 5))
+
         ttk.Button(
             class_controls, text="Auswahl umkehren", command=self.invert_class_selection
         ).pack(side=tk.LEFT, padx=(0, 5))
@@ -1631,13 +1732,12 @@ class KopfnotenGUI:
         list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         ttk.Label(list_frame, text="Verfügbare Klassen:").pack(anchor=tk.W)
-
         self.export_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
         list_scrollbar = ttk.Scrollbar(
             list_frame, orient=tk.VERTICAL, command=self.export_listbox.yview
         )
-        self.export_listbox.config(yscrollcommand=list_scrollbar.set)
 
+        self.export_listbox.config(yscrollcommand=list_scrollbar.set)
         self.export_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -1646,7 +1746,6 @@ class KopfnotenGUI:
         log_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
 
         ttk.Label(log_frame, text="Export-Log:").pack(anchor=tk.W)
-
         self.export_log = scrolledtext.ScrolledText(
             log_frame, width=50, state=tk.DISABLED
         )
@@ -1686,8 +1785,8 @@ class KopfnotenGUI:
         template_scroll = ttk.Scrollbar(
             overview_frame, orient=tk.VERTICAL, command=self.template_list.yview
         )
-        self.template_list.config(yscrollcommand=template_scroll.set)
 
+        self.template_list.config(yscrollcommand=template_scroll.set)
         self.template_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         template_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
 
@@ -1698,6 +1797,7 @@ class KopfnotenGUI:
         ttk.Button(
             template_buttons, text="Aktualisieren", command=self.refresh_template_list
         ).pack(side=tk.LEFT, padx=5)
+
         ttk.Button(
             template_buttons,
             text="Template verwenden",
@@ -1705,7 +1805,7 @@ class KopfnotenGUI:
         ).pack(side=tk.LEFT, padx=5)
 
     # ===================== NEUE FUNKTIONEN =====================
-    
+
     def export_selected_student(self):
         """Exportiert ausgewählten Schüler"""
         selection = self.analysis_tree.selection()
@@ -1723,6 +1823,9 @@ class KopfnotenGUI:
 
         # Template-Prüfung
         template_path = Path(self.template_var.get().strip())
+        # Make sure we're using an absolute path
+        if not template_path.is_absolute():
+            template_path = Path.cwd() / template_path
         if not template_path or not template_path.exists():
             messagebox.showerror(
                 "Template fehlt", "Bitte wählen Sie eine gültige Template-Datei aus."
@@ -1749,7 +1852,7 @@ class KopfnotenGUI:
         # Export-UI vorbereiten
         self.export_running = True
         self.status_manager.set_status(f"Exportiere Schüler: {student_name}...", True)
-        
+
         # Export in separatem Thread
         export_thread = threading.Thread(
             target=self.run_student_export,
@@ -1759,26 +1862,26 @@ class KopfnotenGUI:
         export_thread.start()
 
     def run_student_export(
-        self, 
-        student_id: int, 
-        student_name: str, 
-        student_class: str, 
-        template_path: Path, 
+        self,
+        student_id: int,
+        student_name: str,
+        student_class: str,
+        template_path: Path,
         output_dir: Path
     ):
         """Führt Schüler-Export in separatem Thread aus"""
         try:
             with OptimizedKopfnotenExporter(self.db_path) as exporter:
                 start_time = datetime.now()
-                
+
                 # Export durchführen für einzelnen Schüler
                 summary = exporter.export_horizontal_tables(
                     output_dir, template_path, [student_class], student_id
                 )
-                
+
                 end_time = datetime.now()
                 duration = end_time - start_time
-                
+
                 # Erfolgs-Meldung
                 if summary["gesamt_dateien"] > 0:
                     schueler_result = list(summary["schueler_details"].values())[0]
@@ -1789,25 +1892,25 @@ class KopfnotenGUI:
                         f"Ausgabe: {output_dir}\n\n"
                         f"Format: Horizontale Tabelle"
                     )
-                    
+
                     # GUI-Thread für MessageBox
                     self.root.after(
                         100, lambda: messagebox.showinfo(f"Export für {student_name}", success_msg)
                     )
+
                 else:
                     error_msg = f"❌ Export für {student_name} fehlgeschlagen"
                     self.root.after(
                         100, lambda: messagebox.showerror("Export-Fehler", error_msg)
                     )
-                    
+
         except Exception as e:
             error_msg = f"❌ Export für {student_name} fehlgeschlagen: {str(e)}"
             logging.error(f"Student-Export-Fehler: {e}")
-            
             self.root.after(
                 100, lambda: messagebox.showerror("Export-Fehler", error_msg)
             )
-            
+
         finally:
             self.root.after(100, lambda: self.status_manager.clear_status())
             self.root.after(100, lambda: setattr(self, "export_running", False))
@@ -1829,6 +1932,9 @@ class KopfnotenGUI:
             return
 
         template_path = Path(self.template_var.get().strip())
+        # Make sure we're using an absolute path
+        if not template_path.is_absolute():
+            template_path = Path.cwd() / template_path
         if not template_path or not template_path.exists():
             messagebox.showerror(
                 "Template fehlt", "Bitte wählen Sie eine gültige Template-Datei aus."
@@ -1856,10 +1962,10 @@ class KopfnotenGUI:
         self.export_btn.config(state=tk.DISABLED, text="Export läuft...")
         self.export_progress.start()
         self.clear_export_log()
-
         self.log_to_export(
             f"Starte optimierten horizontalen Export für {len(selected_classes)} Klassen"
         )
+
         self.status_manager.set_status("Optimierter Export läuft...", True)
 
         # Export in separatem Thread
@@ -1924,7 +2030,6 @@ class KopfnotenGUI:
             error_msg = f"❌ Optimierter Export fehlgeschlagen: {str(e)}"
             self.log_to_export(error_msg)
             logging.error(f"Export-Fehler: {e}")
-
             self.root.after(
                 100, lambda: messagebox.showerror("Export-Fehler", error_msg)
             )
@@ -1954,7 +2059,6 @@ class KopfnotenGUI:
     def refresh_template_list(self):
         """Aktualisiert Template-Liste"""
         self.template_list.delete(0, tk.END)
-
         template_dir = Path("templates")
         if template_dir.exists():
             for template_file in template_dir.glob("*.docx"):
@@ -1973,10 +2077,13 @@ class KopfnotenGUI:
         template_path = Path("templates") / template_name
 
         if template_path.exists():
-            self.template_var.set(str(template_path))
+            # Make sure we're using an absolute path
+            absolute_path = template_path.resolve()
+            self.template_var.set(str(absolute_path))
             messagebox.showinfo(
                 "Template gewählt", f"Template ausgewählt: {template_name}"
             )
+
             # Wechsle zum Export-Tab
             self.notebook.select(2)
 
@@ -1998,8 +2105,10 @@ class KopfnotenGUI:
         )
 
         if filename:
-            self.template_var.set(filename)
-            self.log_to_export(f"Template ausgewählt: {Path(filename).name}")
+            # Make sure we're using an absolute path
+            absolute_path = Path(filename).resolve()
+            self.template_var.set(str(absolute_path))
+            self.log_to_export(f"Template ausgewählt: {absolute_path.name}")
 
     def select_output_dir(self):
         """Ausgabeverzeichnis auswählen"""
@@ -2062,11 +2171,13 @@ class KopfnotenGUI:
                 self.log_to_import(
                     f"\nImport abgeschlossen: {successful}/{len(files)} erfolgreich"
                 )
-                self.root.after(100, self.refresh_all_data)
+
+            self.root.after(100, self.refresh_all_data)
 
         except Exception as e:
             self.log_to_import(f"❌ Import-Fehler: {e}")
             logging.error(f"Allgemeiner Import-Fehler: {e}")
+
         finally:
             self.root.after(100, lambda: self.status_manager.clear_status())
 
@@ -2105,7 +2216,6 @@ class KopfnotenGUI:
 
     def update_log_widget(self, widget, message: str):
         """Thread-sichere Log-Widget-Aktualisierung"""
-
         def update():
             widget.config(state=tk.NORMAL)
             widget.insert(tk.END, message + "\n")
@@ -2150,11 +2260,11 @@ class KopfnotenGUI:
                 )
                 classes = [row[0] for row in cursor.fetchall()]
 
-            self.export_listbox.delete(0, tk.END)
-            for class_name in classes:
-                self.export_listbox.insert(tk.END, class_name)
+                self.export_listbox.delete(0, tk.END)
+                for class_name in classes:
+                    self.export_listbox.insert(tk.END, class_name)
 
-            self.log_to_export(f"{len(classes)} Klassen gefunden")
+                self.log_to_export(f"{len(classes)} Klassen gefunden")
 
         except Exception as e:
             logging.error(f"Fehler beim Laden der Klassen: {e}")
@@ -2171,9 +2281,9 @@ class KopfnotenGUI:
                 )
                 classes = ["Alle"] + [row[0] for row in cursor.fetchall()]
 
-            self.class_filter["values"] = classes
-            if classes:
-                self.class_filter.set(classes[0])
+                self.class_filter["values"] = classes
+                if classes:
+                    self.class_filter.set(classes[0])
 
         except Exception as e:
             logging.error(f"Fehler beim Laden der Klassen für Analyse: {e}")
@@ -2195,6 +2305,7 @@ class KopfnotenGUI:
                 "SV-Noten",
                 "Vollständig",
             ]
+
             self.analysis_tree["columns"] = columns
             self.analysis_tree.column("#0", width=0, stretch=False)
 
@@ -2205,20 +2316,20 @@ class KopfnotenGUI:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
                     """
-                    SELECT 
+                    SELECT
                         s.schueler_id,
                         s.name,
                         s.klasse,
                         COUNT(n.noten_id) as faecher_count,
                         SUM(CASE WHEN n.note_av IS NOT NULL THEN 1 ELSE 0 END) as av_count,
                         SUM(CASE WHEN n.note_sv IS NOT NULL THEN 1 ELSE 0 END) as sv_count,
-                        CASE WHEN COUNT(n.noten_id) = SUM(CASE WHEN n.note_av IS NOT NULL AND n.note_sv IS NOT NULL THEN 1 ELSE 0 END) 
+                        CASE WHEN COUNT(n.noten_id) = SUM(CASE WHEN n.note_av IS NOT NULL AND n.note_sv IS NOT NULL THEN 1 ELSE 0 END)
                              THEN 'Ja' ELSE 'Nein' END as vollstaendig
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
                     GROUP BY s.schueler_id, s.name, s.klasse
                     ORDER BY s.klasse, s.name
-                """
+                    """
                 )
 
                 for row in cursor.fetchall():
@@ -2236,19 +2347,20 @@ class KopfnotenGUI:
             self.analysis_tree.delete(*self.analysis_tree.get_children())
 
             query = """
-                SELECT 
+                SELECT
                     s.schueler_id,
                     s.name,
                     s.klasse,
                     COUNT(n.noten_id) as faecher_count,
                     SUM(CASE WHEN n.note_av IS NOT NULL THEN 1 ELSE 0 END) as av_count,
                     SUM(CASE WHEN n.note_sv IS NOT NULL THEN 1 ELSE 0 END) as sv_count,
-                    CASE WHEN COUNT(n.noten_id) = SUM(CASE WHEN n.note_av IS NOT NULL AND n.note_sv IS NOT NULL THEN 1 ELSE 0 END) 
+                    CASE WHEN COUNT(n.noten_id) = SUM(CASE WHEN n.note_av IS NOT NULL AND n.note_sv IS NOT NULL THEN 1 ELSE 0 END)
                          THEN 'Ja' ELSE 'Nein' END as vollstaendig
                 FROM schueler s
                 LEFT JOIN noten n ON s.schueler_id = n.schueler_id
                 WHERE 1=1
             """
+
             params = []
 
             if class_filter and class_filter != "Alle":
@@ -2312,6 +2424,7 @@ class KopfnotenGUI:
                 messagebox.showinfo(
                     "Gelöscht", f"Schüler '{student_name}' wurde gelöscht."
                 )
+
                 self.refresh_analysis_data()
                 self.load_classes_for_export()
 
@@ -2399,6 +2512,7 @@ Inhalt:
                 log_window, wrap=tk.WORD, font=("Courier", 9)
             )
             log_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
             log_text.insert(tk.END, content)
             log_text.config(state=tk.DISABLED)
             log_text.see(tk.END)
@@ -2419,8 +2533,8 @@ Inhalt:
                 Path("output_database"),
                 Path("logs"),
             ]
-            report = []
 
+            report = []
             for directory in dirs:
                 if directory.exists():
                     readable = os.access(directory, os.R_OK)
@@ -2442,9 +2556,11 @@ Inhalt:
 
     def show_about(self):
         """Zeigt Über-Dialog"""
-        about_text = """AES-Kopfnoten-Manager v2.1 - Optimiert
+        about_text = """Kopfnoten-Manager
+
 Entwickelt für IGS in Hessen
-© 2025"""
+
+© Jörg Pospischil 2025"""
 
         messagebox.showinfo("Über", about_text)
 
@@ -2453,16 +2569,19 @@ Entwickelt für IGS in Hessen
         help_text = """Linux-Hilfe - Optimierte Version
 
 SCHNELLSTART:
+
 1. chmod 755 templates/ output_word/ output_database/ logs/
 2. python kopfnotenapp.py
 
 FEATURES:
+
 • Template-Designer: Einfache Template-Erstellung
 • Optimierter Export: Horizontale 3-Zeilen-Tabellen mit Beschriftungsspalte
 • Einzelschüler-Export: Export für einzelne ausgewählte Schüler
 • Vereinfachte Noten-Bearbeitung
 
 PROBLEMLÖSUNG:
+
 • Bei Berechtigungsfehlern: sudo chown $USER:$USER -R ./
 • Templates in LibreOffice Writer bearbeiten
 • Logs prüfen: tail -f logs/kopfnoten_gui.log"""
@@ -2480,7 +2599,6 @@ PROBLEMLÖSUNG:
         if messagebox.askokcancel("Beenden", "Anwendung beenden?"):
             self.root.destroy()
 
-
 def main():
     """Hauptfunktion"""
     try:
@@ -2497,7 +2615,6 @@ def main():
     except Exception as e:
         logging.error(f"Kritischer Anwendungsfehler: {e}")
         print(f"Fehler beim Starten: {e}")
-
 
 if __name__ == "__main__":
     main()
