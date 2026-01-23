@@ -1,0 +1,34 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+.pytest_cache/
+
+# Databases (contain student data)
+*.db
+*.sqlite3
+output_database/
+
+# Output directories (contain personal data)
+output_excel/
+output_word/
+output/
+
+# Logs (may contain personal data)
+logs/
+*.log
+html_logs.txt
+
+# Temp files
+temp/
+*.tmp
+
+# Configuration with credentials
+sph_config.json
+
+# IDE specific
+.vscode/
+.idea/
+.DS_Store
