@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import sqlite3
 import threading
+import queue
 import logging
 import sys
 import os
@@ -12,7 +13,7 @@ import re
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Callable
 from docxtpl import DocxTemplate
 from docx import Document
 from docx.shared import Inches
@@ -1553,6 +1554,31 @@ class KopfnotenGUI:
         self.template_var = tk.StringVar()
         self.output_var = tk.StringVar(value="output_word")
         self.export_running = False
+        self.ui_queue = queue.Queue()
+
+        # --- LOGIN CHECK ---
+        from credentials import CredentialManager
+        from login_gui import LoginWindow
+        
+        self.credentials_manager = CredentialManager()
+        
+        # Hide main window during login
+        self.root.withdraw()
+        
+        login_win = LoginWindow(self.root, self.credentials_manager)
+        self.root.wait_window(login_win.window)
+        
+        if not login_win.result:
+            try:
+                if self.root.winfo_exists():
+                    self.root.destroy()
+            except:
+                pass
+            sys.exit(0)
+            
+        self.root.deiconify()
+        # -------------------
+
         # GUI-Komponenten
         self.notebook = None
         self.import_listbox = None
@@ -1561,10 +1587,28 @@ class KopfnotenGUI:
         self.analysis_tree = None
         self.stats_text = None
         self.selected_schueler_var = tk.StringVar(value="")
+        self.student_search_after = None # For debouncing
         # Setup
         self.create_gui()
         self.load_initial_data()
         self.setup_linux_environment()
+        self.process_ui_queue()
+
+    def process_ui_queue(self):
+        """Processes UI updates from background threads"""
+        try:
+            while True:
+                task = self.ui_queue.get_nowait()
+                if callable(task):
+                    task()
+                self.ui_queue.task_done()
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_ui_queue)
+
+    def queue_ui(self, func: Callable, *args, **kwargs):
+        """Queues a UI update function to be run on the main thread"""
+        self.ui_queue.put(lambda: func(*args, **kwargs))
 
     def setup_application(self):
         """Grundlegende Anwendungseinrichtung"""
@@ -1583,6 +1627,7 @@ class KopfnotenGUI:
             Path("logs"),
             Path("templates"),
             Path("output_word"),
+            Path("output_excel"),
             Path("output_database"),
             Path("temp"),
         ]
@@ -1621,64 +1666,13 @@ class KopfnotenGUI:
     # Old SPH Tab removed
 
 
-    def search_schools(self):
-        """Sucht nach Schulen"""
-        term = self.sph_search_var.get().lower()
-        if len(term) < 3:
-            messagebox.showinfo("Suche", "Bitte mindestens 3 Zeichen eingeben.")
-            return
-            
-        try:
-            from sph_downloader import SPHDownloader
-            downloader = SPHDownloader(logger=logging.getLogger("sph"))
-            schools = downloader.get_schools()
-            
-            self.sph_school_listbox.delete(0, tk.END)
-            self.found_schools = [] 
-            
-            count = 0
-            for s in schools:
-                # Check Name, City AND ID
-                if term in s["name"].lower() or term in s["city"].lower() or term in str(s["id"]):
-                    self.sph_school_listbox.insert(tk.END, s["label"])
-                    self.found_schools.append(s)
-                    count += 1
-            
-            if count == 0:
-                self.sph_school_listbox.insert(tk.END, "Keine Schulen gefunden.")
-                
-        except Exception as e:
-            messagebox.showerror("Fehler", f"Suchfehler: {e}")
-
-    def apply_school_selection(self, event=None):
-        """Übernimmt Auswahl"""
-        selection = self.sph_school_listbox.curselection()
-        if selection and hasattr(self, "found_schools"):
-            index = selection[0]
-            if index < len(self.found_schools):
-                s = self.found_schools[index]
-                self.sph_school_entry.delete(0, tk.END)
-                self.sph_school_entry.insert(0, s["id"])
-                
-                # Zu "Recent" hinzufügen
-                self.add_recent_school(s)
-
-    def add_recent_school(self, school_data):
-        """Fügt Schule zu 'Zuletzt verwendet' hinzu"""
-        if not hasattr(self, "recent_schools"):
-            self.recent_schools = []
-            
-        # Check if already in list (by ID)
-        existing = next((i for i, s in enumerate(self.recent_schools) if s["id"] == school_data["id"]), -1)
-        if existing >= 0:
-            self.recent_schools.pop(existing)
-            
-        self.recent_schools.insert(0, school_data)
-        self.recent_schools = self.recent_schools[:5] # Max 5
-        self.save_sph_config() # Persistieren
+    # School Search Methods Removed (Handled in Login Window)
+    def search_schools(self): pass
+    def apply_school_selection(self, event=None): pass
+    def add_recent_school(self, school_data): pass
 
     def load_sph_config(self):
-        """Lädt SPH Konfiguration"""
+        """Lädt SPH Konfiguration (nur Klassen)"""
         try:
             import json
             config_path = Path("sph_config.json")
@@ -1686,13 +1680,7 @@ class KopfnotenGUI:
                 with open(config_path, "r") as f:
                     config = json.load(f)
                 
-                if "school" in config:
-                    self.sph_school_entry.delete(0, tk.END)
-                    self.sph_school_entry.insert(0, config["school"])
-                
-                if "user" in config:
-                    self.sph_user_entry.delete(0, tk.END)
-                    self.sph_user_entry.insert(0, config["user"])
+                # School/User logic moved to credentials.py / LoginWindow
                 
                 if "classes" in config:
                     classes = config["classes"]
@@ -1700,39 +1688,29 @@ class KopfnotenGUI:
                         if int(year) in self.spinboxes:
                             self.spinboxes[int(year)].set(count)
                             
-                # Recent Schools laden
-                if "recent_schools" in config:
-                    self.recent_schools = config["recent_schools"]
-                    if self.recent_schools:
-                        self.sph_school_listbox.delete(0, tk.END)
-                        self.found_schools = self.recent_schools
-                        self.sph_school_listbox.insert(tk.END, "--- Zuletzt ausgewählt ---")
-                        # Dummy placeholder in found_schools matching index offset if needed?
-                        # Besser: Nur Schulen anzeigen
-                        # Reset Listbox
-                        self.sph_school_listbox.delete(0, tk.END)
-                        for s in self.recent_schools:
-                            self.sph_school_listbox.insert(tk.END, s.get("label", f"{s.get('name','')} [{s.get('id','')}]"))
-                            
         except Exception as e:
             logging.error(f"Fehler beim Laden der Config: {e}")
 
     def save_sph_config(self):
-        """Speichert SPH Konfiguration"""
+        """Speichert SPH Konfiguration (nur Klassen)"""
         try:
             import json
             config_path = Path("sph_config.json")
             
+            # Read existing to preserve school/user if they were there (for prefill consistency with LoginWindow)
+            config = {}
+            if config_path.exists():
+                 try: 
+                     with open(config_path, "r") as f: config = json.load(f)
+                 except: pass
+
             classes = {}
             for year, spin in self.spinboxes.items():
                 classes[str(year)] = spin.get()
-
-            config = {
-                "school": self.sph_school_entry.get().strip(),
-                "user": self.sph_user_entry.get().strip(),
-                "classes": classes,
-                "recent_schools": getattr(self, "recent_schools", [])
-            }
+            
+            config["classes"] = classes
+            # Note: We rely on LoginWindow/Credentials to manage auth persistence.
+            # We don't overwrite school/user here anymore because we don't have the widgets.
             
             with open(config_path, "w") as f:
                 json.dump(config, f)
@@ -1740,11 +1718,39 @@ class KopfnotenGUI:
         except Exception as e:
             logging.error(f"Fehler beim Speichern der Config: {e}")
 
+    def show_login_window(self):
+        """Erlaubt das Ändern der Zugangsdaten"""
+        from login_gui import LoginWindow
+        login_win = LoginWindow(self.root, self.credentials_manager)
+        self.root.wait_window(login_win.window)
+        # Refresh the Import tab if it exists
+        self.create_widgets_sph_section()
+
+    def create_widgets_sph_section(self):
+        """Aktualisiert nur den SPH-Anmeldebereich im Import-Tab"""
+        # This is a bit tricky if we want to replace existing widgets. 
+        # For simplicity, we just check if self.sph_login_container exists and refresh it.
+        if hasattr(self, "sph_login_container"):
+            for widget in self.sph_login_container.winfo_children():
+                widget.destroy()
+            
+            if self.credentials_manager.credentials:
+                 sch, usr, _ = self.credentials_manager.credentials
+                 ttk.Label(self.sph_login_container, text=f"✅ Angemeldet als: {usr} @ {sch}", foreground="green", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+                 ttk.Button(self.sph_login_container, text="Anmeldung ändern", command=self.show_login_window).pack(anchor=tk.W, pady=5)
+            else:
+                 ttk.Label(self.sph_login_container, text="⚠️ Nicht eingeloggt", foreground="red").pack(anchor=tk.W)
+                 ttk.Button(self.sph_login_container, text="Jetzt anmelden", command=self.show_login_window).pack(anchor=tk.W, pady=5)
+
     def run_sph_import(self):
         """Führt den SPH-Import Prozess aus"""
-        school = self.sph_school_entry.get().strip()
-        user = self.sph_user_entry.get().strip()
-        pw = self.sph_pw_entry.get().strip()
+        # Credentials from Manager
+        if not self.credentials_manager.credentials:
+             messagebox.showerror("Fehler", "Nicht eingeloggt. Bitte melden Sie sich zuerst an.")
+             self.show_login_window()
+             return
+             
+        school, user, pw = self.credentials_manager.credentials
         
         # Config aus Spinboxen
         tasks = []
@@ -1760,15 +1766,11 @@ class KopfnotenGUI:
              messagebox.showerror("Konfigurationsfehler", f"Formatfehler: {e}")
              return
 
-        if not (school and user and pw):
-             messagebox.showerror("Fehler", "Bitte Zugangsdaten ausfüllen!")
-             return
-            
         if not tasks:
             messagebox.showerror("Konfigurationsfehler", "Keine Züge ausgewählt (Alle auf 0?).")
             return
             
-        # Speichern
+        # Speichern (Nur Config, nicht user/pw da jetzt secured)
         self.save_sph_config()
 
         import threading
@@ -1782,16 +1784,13 @@ class KopfnotenGUI:
             downloader = SPHDownloader(logger=logging.getLogger("sph"))
             
             # Login
-            self.root.after(0, lambda: self.status_manager.set_status("SPH: Login..."))
+            self.queue_ui(self.status_manager.set_status, "SPH: Login...")
             downloader.login(school, user, pw)
             
             # Download Loop
             downloaded_files = []
             output_dir = Path("temp")
             output_dir.mkdir(parents=True, exist_ok=True)
-            
-            total_classes = sum(t[1] for t in tasks)
-            current = 0
             
             letters = "abcdefghijklmnopqrstuvwxyz"
             
@@ -1800,32 +1799,22 @@ class KopfnotenGUI:
                     suffix = letters[i]
                     class_name = f"{jg}{suffix}" # 05a
                     
-                    self.root.after(0, lambda c=class_name: self.status_manager.set_status(f"Lade Klasse {c}..."))
+                    self.queue_ui(self.status_manager.set_status, f"Lade Klasse {class_name}...")
                     
                     file_path = downloader.download_class_list(class_name, jg, output_dir)
                     if file_path:
                         downloaded_files.append(file_path)
-                    
-                    current += 1
             
             # Import Trigger
             if downloaded_files:
-                self.root.after(0, lambda: self.status_manager.set_status(f"Importiere {len(downloaded_files)} Dateien..."))
-                
-                # Import logic - using existing import methods
-                # Must run in main thread for safety regarding tkinter updates if import uses UI?
-                # Actually import_excel_file is independent of UI except logger.
-                # But self.import_files logic might update UI.
-                
-                # We simply call the core import loop here or delegate back to main thread.
-                # For safety, let's schedule it on main thread.
-                self.root.after(0, lambda: self._process_downloaded_files(downloaded_files))
+                self.queue_ui(self.status_manager.set_status, f"Importiere {len(downloaded_files)} Dateien...")
+                self.queue_ui(self._process_downloaded_files, downloaded_files)
             else:
-                self.root.after(0, lambda: messagebox.showwarning("Ergebnis", "Keine Dateien erfolgreich geladen."))
+                self.queue_ui(messagebox.showwarning, "Ergebnis", "Keine Dateien erfolgreich geladen.")
 
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("SPH Fehler", f"{e}"))
-            self.root.after(0, lambda: self.status_manager.set_status("Fehler bei SPH Import"))
+            self.queue_ui(messagebox.showerror, "SPH Fehler", f"{e}")
+            self.queue_ui(self.status_manager.set_status, "Fehler bei SPH Import")
 
     def _process_downloaded_files(self, file_paths):
         """Verarbeitet heruntergeladene Dateien"""
@@ -1927,38 +1916,12 @@ class KopfnotenGUI:
         sph_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         
         # -- Links: Credentials & Search --
-        
-        # Suche
-        search_frame = ttk.Frame(sph_left)
-        search_frame.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Label(search_frame, text="Schule suchen (Name/Ort/ID):").pack(side=tk.LEFT)
-        self.sph_search_var = tk.StringVar()
-        entry = ttk.Entry(search_frame, textvariable=self.sph_search_var, width=20)
-        entry.pack(side=tk.LEFT, padx=5)
-        entry.bind("<Return>", lambda e: self.search_schools())
-        ttk.Button(search_frame, text="🔍", width=3, command=self.search_schools).pack(side=tk.LEFT)
-        
-        # Ergebnis-Liste
-        self.sph_school_listbox = tk.Listbox(sph_left, height=4)
-        self.sph_school_listbox.pack(fill=tk.X, expand=False, padx=5, pady=5)
-        self.sph_school_listbox.bind("<<ListboxSelect>>", self.apply_school_selection)
-
+    
         # ID & Login Grid
-        login_frame = ttk.Frame(sph_left)
-        login_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(login_frame, text="ID:").grid(row=0, column=0, sticky=tk.W)
-        self.sph_school_entry = ttk.Entry(login_frame, width=8)
-        self.sph_school_entry.grid(row=0, column=1, padx=2, sticky=tk.W)
-        self.sph_school_entry.insert(0, "4043")
-        
-        ttk.Label(login_frame, text="User:").grid(row=0, column=2, padx=(5,0), sticky=tk.W)
-        self.sph_user_entry = ttk.Entry(login_frame, width=15)
-        self.sph_user_entry.grid(row=0, column=3, padx=2, sticky=tk.W)
-        
-        ttk.Label(login_frame, text="PW:").grid(row=0, column=4, padx=(5,0), sticky=tk.W)
-        self.sph_pw_entry = ttk.Entry(login_frame, width=15, show="*")
-        self.sph_pw_entry.grid(row=0, column=5, padx=2, sticky=tk.W)
+        self.sph_login_container = ttk.Frame(sph_left)
+        self.sph_login_container.pack(fill=tk.X, padx=5, pady=5)
+        self.create_widgets_sph_section()
+
 
         # -- Rechts: Konfiguration --
         ttk.Label(sph_right, text="Klassen-Konfiguration (Züge):", font=("Arial", 9, "bold")).pack(anchor=tk.W)
@@ -1998,9 +1961,11 @@ class KopfnotenGUI:
         ttk.Label(filter_controls, text="Klasse:").pack(side=tk.LEFT)
         self.class_filter = ttk.Combobox(filter_controls, width=10, state="readonly")
         self.class_filter.pack(side=tk.LEFT, padx=(5, 15))
+        self.class_filter.bind("<<ComboboxSelected>>", lambda e: self.search_students())
         ttk.Label(filter_controls, text="Schüler:").pack(side=tk.LEFT)
         self.student_search = ttk.Entry(filter_controls, width=20)
         self.student_search.pack(side=tk.LEFT, padx=(5, 15))
+        self.student_search.bind("<KeyRelease>", lambda e: self.search_students())
         ttk.Button(filter_controls, text="Suchen", command=self.search_students).pack(
             side=tk.LEFT, padx=(0, 5)
         )
@@ -3028,12 +2993,18 @@ class KopfnotenGUI:
         else:
             return "Unvollständig"
 
-    def search_students(self):
-        """Sucht Schüler"""
-        class_filter = self.class_filter.get()
-        student_filter = self.student_search.get().strip()
-        self.refresh_analysis_data(class_filter, student_filter)
-        self.status_manager.set_status("Suche ausgeführt")
+    def search_students(self, event=None):
+        """Sucht Schüler mit Debounce"""
+        if self.student_search_after:
+            self.root.after_cancel(self.student_search_after)
+            
+        def run_search():
+            class_filter = self.class_filter.get()
+            student_filter = self.student_search.get().strip()
+            self.refresh_analysis_data(class_filter, student_filter)
+            self.status_manager.set_status(f"Filter angewendet: {class_filter}, Suche: {student_filter}")
+
+        self.student_search_after = self.root.after(300, run_search)
 
     def reset_filters(self):
         """Setzt Filter zurück"""
@@ -3213,13 +3184,7 @@ PROBLEMLÖSUNG:
 
     def on_closing(self):
         """Behandelt Schließen"""
-        if self.export_running:
-            messagebox.showwarning(
-                "Export läuft", "Bitte warten Sie bis der Export abgeschlossen ist."
-            )
-            return
-        if messagebox.askokcancel("Beenden", "Anwendung beenden?"):
-            self.root.destroy()
+        self.root.destroy()
 
 def main():
     """Hauptfunktion"""

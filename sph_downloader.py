@@ -16,7 +16,7 @@ class SPHDownloader:
         self.client = None
         
     def get_schools(self):
-        """Lädt die Schulliste via LanisAPI (oder Cache)"""
+        """Lädt die Schulliste via SPH Endpoint (oder Cache)"""
         cache_file = self.output_dir / "schools.json"
         
         # Cache prüfen (1 Tag gültig)
@@ -29,25 +29,32 @@ class SPHDownloader:
                     pass
 
         try:
-            self.logger.info("Lade Schulliste via LanisAPI...")
-            # LanisAPI get_schools is static-like or works with dummy client
-            # We use a dummy account to init client if needed, or just standard init
-            dummy_client = LanisClient(LanisAccount("0", "", ""))
-            lanis_schools = dummy_client.get_schools()
+            self.logger.info("Lade Schulliste vom SPH Exporteur...")
+            # Direct fetch to avoid library overhead/bugs in get_schools
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            url = "https://startcache.schulportal.hessen.de/exporteur.php?a=schoollist"
+            r = requests.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
             
+            data = r.json()
             schools = []
-            for s in lanis_schools:
-                # LanisAPI returns dicts with Id, Name, Ort
-                sid = str(s.get("Id", ""))
-                name = s.get("Name", "")
-                city = s.get("Ort", "")
-                
-                schools.append({
-                    "id": sid,
-                    "name": name,
-                    "city": city,
-                    "label": f"{name} ({city}) [{sid}]"
-                })
+            
+            # Data is a list of categories: [{"Kategorie": "...", "Schulen": [...]}, ...]
+            for group in data:
+                if "Schulen" in group:
+                    for s in group["Schulen"]:
+                        sid = str(s.get("Id", ""))
+                        name = s.get("Name", "")
+                        city = s.get("Ort", "")
+                        
+                        schools.append({
+                            "id": sid,
+                            "name": name,
+                            "city": city,
+                            "label": f"{name} ({city}) [{sid}]"
+                        })
             
             # Cache speichern
             with open(cache_file, "w", encoding="utf-8") as f:
@@ -68,12 +75,21 @@ class SPHDownloader:
             self.client = LanisClient(account)
             self.client.authenticate()
             
+            if not self.client.authenticated:
+                 raise ConnectionError("Authentifizierung abgeschlossen, aber Client ist nicht als 'authenticated' markiert (Handshake Fehler?).")
+
             self.logger.info("Login erfolgreich.")
             return True
         except Exception as e:
             import traceback
-            self.logger.error(f"Login fehlgeschlagen: {e}\n{traceback.format_exc()}")
-            raise ConnectionError(f"Login fehlgeschlagen: {e}")
+            err_msg = str(e)
+            self.logger.error(f"Login fehlgeschlagen: {err_msg}\n{traceback.format_exc()}")
+            
+            # Simple heuristic for auth/connection
+            if any(x in err_msg.lower() for x in ["auth", "login", "credentials", "zugangsdaten", "passwort"]):
+                 raise ValueError(f"Login fehlgeschlagen: {err_msg}")
+            else:
+                 raise ConnectionError(f"Verbindungsfehler: {err_msg}")
 
     def download_class_list(self, class_name, year_level, output_dir):
         """Lädt Liste für eine Klasse herunter"""
@@ -95,10 +111,24 @@ class SPHDownloader:
             
             # Use the official property to get cookies (school_id and session_id)
             if self.client:
-                cookies = self.client.authentication_cookies
-                session.cookies.set("i", cookies.school_id)
-                session.cookies.set("sid", cookies.session_id)
-                self.logger.info(f"Cookies gesetzt: i={cookies.school_id}, sid={cookies.session_id}")
+                # We extract cookies manually from the client's internal Request helper
+                # to be sure we get the current state.
+                from lanisapi.helpers.request import Request as LanisRequest
+                cookies = LanisRequest.get_cookies()
+                
+                # SPH expects 'i' and 'sid'
+                # httpx cookies can be accessed via .get(name)
+                # We try to get them without being too picky about domains
+                sid = cookies.get("sid")
+                i = cookies.get("i")
+                
+                if not sid:
+                     self.logger.error("Download fehlgeschlagen: Keine Session-ID (sid) gefunden.")
+                     raise ConnectionError("Keine aktive Session (sid fehlt).")
+                
+                session.cookies.set("i", i or str(school_id))
+                session.cookies.set("sid", sid)
+                self.logger.info(f"Cookies gesetzt: i={i or school_id}, sid={sid[:8]}...")
             
             # Also set User-Agent to match
             session.headers.update({
