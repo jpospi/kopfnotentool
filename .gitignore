@@ -1,34 +1,36 @@
-# Python specific
+# Python / Env
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
 .venv/
+env/
 .env
-.pytest_cache/
 
-# Databases (contain student data)
-*.db
-*.sqlite3
-output_database/
-
-# Output directories (contain personal data)
-output_excel/
-output_word/
-output/
-
-# Logs (may contain personal data)
-logs/
-*.log
-html_logs.txt
-
-# Temp files
-temp/
-*.tmp
-
-# Configuration with credentials
-sph_config.json
-
-# IDE specific
+# IDE
 .vscode/
 .idea/
+
+# OS
 .DS_Store
+
+# Logs
+logs/
+*.log
+
+# Temporary / Cache
+temp/
+
+# Application Data (Output)
+output_database/
+output_excel/
+output_word/
+kopfnoten_secure.db
+
+# Configuration with Secrets
+sph_config.json
+lanis_cookie.pkl
+keyring_pass.cfg
+
+# Installer
+build/
+dist/
+*.spec

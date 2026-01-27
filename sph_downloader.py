@@ -14,6 +14,7 @@ class SPHDownloader:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True, parents=True)
         self.client = None
+        self.school_id = None
         
     def get_schools(self):
         """Lädt die Schulliste via SPH Endpoint (oder Cache)"""
@@ -71,6 +72,20 @@ class SPHDownloader:
         self.logger.info(f"Versuche Login bei Schule {school_id} als {username} via LanisAPI")
         
         try:
+            # WORKAROUND for lanisapi GC bug:
+            # The library has a global httpx client that can be closed by __del__ of previous clients.
+            from lanisapi.helpers.request import Request as LanisRequest
+            import httpx
+            try:
+                # Test if client is closed
+                LanisRequest.client.post("https://example.com", timeout=0.001)
+            except RuntimeError as re:
+                if "closed" in str(re).lower():
+                    self.logger.info("LanisAPI internal client was closed. Re-opening...")
+                    LanisRequest.client = httpx.Client(timeout=httpx.Timeout(30.0, connect=60.0))
+            except Exception:
+                pass # Other errors are fine, we just want to catch "client closed"
+
             account = LanisAccount(school_id, username, password)
             self.client = LanisClient(account)
             self.client.authenticate()
@@ -78,6 +93,7 @@ class SPHDownloader:
             if not self.client.authenticated:
                  raise ConnectionError("Authentifizierung abgeschlossen, aber Client ist nicht als 'authenticated' markiert (Handshake Fehler?).")
 
+            self.school_id = school_id
             self.logger.info("Login erfolgreich.")
             return True
         except Exception as e:
@@ -119,16 +135,16 @@ class SPHDownloader:
                 # SPH expects 'i' and 'sid'
                 # httpx cookies can be accessed via .get(name)
                 # We try to get them without being too picky about domains
-                sid = cookies.get("sid")
-                i = cookies.get("i")
+                sid = cookies.get("sid", domain="")
+                i = cookies.get("i", domain="") or self.school_id
                 
                 if not sid:
                      self.logger.error("Download fehlgeschlagen: Keine Session-ID (sid) gefunden.")
                      raise ConnectionError("Keine aktive Session (sid fehlt).")
                 
-                session.cookies.set("i", i or str(school_id))
+                session.cookies.set("i", i)
                 session.cookies.set("sid", sid)
-                self.logger.info(f"Cookies gesetzt: i={i or school_id}, sid={sid[:8]}...")
+                self.logger.info(f"Cookies gesetzt: i={i}, sid={sid[:8]}...")
             
             # Also set User-Agent to match
             session.headers.update({

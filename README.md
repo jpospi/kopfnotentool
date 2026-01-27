@@ -7,10 +7,11 @@ Das Tool richtet sich vor allem an Integrierte Gesamtschulen (IGS) in Hessen, di
 
 ## Hauptfunktionen
 
-1. **Excel‑Import**
+1. **SPH‑Login & Excel‑Import**
+   - Direkter Login im Schulportal Hessen (SPH) zum automatisierten Abruf von Kopfnotendaten.
    - Einlesen von Klassen‑Excel‑Dateien aus dem SPH.
    - Automatisches Erkennen von Fach‑ und Lehrer‑Informationen.
-   - Speicherung der Daten in einer gesicherten, lokalen SQLite‑Datenbank (`kopfnoten_secure.db`).
+   - Speicherung der Daten in einer gesicherten, lokalen SQLite‑Datenbank.
 
 2. **Analyse‑Tab**
    - Anzeige von Lernenden, Klassen und Noten‑Statistiken.
@@ -27,11 +28,6 @@ Das Tool richtet sich vor allem an Integrierte Gesamtschulen (IGS) in Hessen, di
    - Visueller Designer für Word‑Templates (horizontales 3‑Zeilen‑Layout).
    - Dynamische Erstellung von Tabellen mit variabler Fach‑Anzahl pro Schüler.
    - Speicherung als `.docx`‑Datei.
-
-5. **SPH‑Downloader**
-   - Authentifizierung über das Schulportal Hessen (SPH) mittels `lanisapi`.
-   - Herunterladen von Klassen‑Excel‑Dateien für ausgewählte Schulen.
-   - Caching der Schulliste für schnellere Wiederholungen.
 
 
 ## Installation
@@ -55,6 +51,20 @@ pip install -r requirements.txt
 # Anwendung starten
 python app.py
 ```
+
+### Schulportal-Login (SPH) und Import
+Das Tool bietet eine integrierte Anbindung an das Schulportal Hessen.
+Sie können sich direkt mit Ihren SPH-Zugangsdaten anmelden.
+Das Passwort wird **nicht** im Klartext gespeichert. Es wird lokal verschlüsselt (via `keyring` und `cryptography`) abgelegt, sodass Sie sich bei jedem Neustart auch offline anmelden können.
+Zum direkt Download der Excel-Listen müssen Sie Tooladmin für das Kopfnotenmodul sein und angeben, wie viele Klassen es pro Jahrgang gibt. Es besteht aber auch die Möglichkeit, die Listen aus dem SPH herunterzuladen und manuell zu importieren.
+
+
+### Analyse und Bearbeitung
+Der Analyse-Tab bietet eine zentrale Übersicht über den Status aller eingelesenen Schüler.
+Das System berechnet automatisch, ob ein Schüler "Vollständig" (alle erforderlichen Noten vorhanden) oder "Unvollständig" ist.
+Suchen und Filterfunktionen ermöglichen es Ihnen, gezielt nach unvollständigen Schülern zu suchen und zu filtern.
+Durch Doppelklick auf einen Schüler (Spalte "Fächer") öffnet sich ein Editor, in dem Sie fehlende Noten direkt manuell nachtragen können.
+
 
 ## Konfiguration
 

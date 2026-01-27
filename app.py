@@ -1,5 +1,7 @@
+print("Starting...")
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 import sqlite3
 import threading
 import queue
@@ -57,10 +59,7 @@ FAECHER_MAPPING = {
     "Et": "Ethik",
     "Eth": "Ethik",
     "Ethik": "Ethik",
-    # Geschichte
-    "Ge": "Geschichte",
-    "Ges": "Geschichte",
-    "Geschichte": "Geschichte",
+    "Ethik (Et)": "Ethik",
     # Kunst
     "Ku": "Kunst",
     "Kun": "Kunst",
@@ -93,10 +92,14 @@ FAECHER_MAPPING = {
     "Bi": "Biologie",
     "Bio": "Biologie",
     "Biologie": "Biologie",
-    # Gesellschaftskunde
-    "Gl": "Gesellschaftskunde",
-    "Gesell": "Gesellschaftskunde",
-    "Gesellschaftskunde": "Gesellschaftskunde",
+    # Geschichte -> Gesellschaftslehre
+    "Ge": "Gesellschaftslehre",
+    "Ges": "Gesellschaftslehre",
+    "Geschichte": "Gesellschaftslehre",
+    # Gesellschaftskunde -> Gesellschaftslehre
+    "Gl": "Gesellschaftslehre",
+    "Gesell": "Gesellschaftslehre",
+    "Gesellschaftskunde": "Gesellschaftslehre",
     # Französisch
     "Fr": "Französisch",
     "Fra": "Französisch",
@@ -113,7 +116,70 @@ FAECHER_MAPPING = {
     "Rel": "Religion",
     "Rel.1": "Religion",
     "Religion": "Religion",
+    "Religion (ev)": "Religion (ev)",
+    "Religion (kath)": "Religion (kath)",
+    "Rev": "Religion (ev)",
+    "Rrk": "Religion (kath)",
+    # Neue Fächer
+    "Holz": "Holzbearbeitung",
+    "Holzbearbeitung": "Holzbearbeitung",
+    "Präs": "Präsentationstechnik",
+    "Präsentationstechnik": "Präsentationstechnik",
+    "Ernährung": "Ernährung",
+    "Ernährung und Gesundheit": "Ernährung und Gesundheit",
+    "Kraft": "Kraftsport",
+    "Kraftsport": "Kraftsport",
+    "Kreativ": "Kreativ gestalten",
+    "Kreativ gestalten": "Kreativ gestalten",
+    "Textil": "Textiles Gestalten",
+    "Textiles Gestalten": "Textiles Gestalten",
 }
+
+# Fächer, die eine Gruppe bilden (gegenseitiger Ausschluss)
+TRIAD_RELIGION_ETHIK = [
+    ("Ethik", None),
+    ("Religion", "evangelisch"),
+    ("Religion", "katholisch")
+]
+
+# Definition der Status-Typen und Mapping
+# Standard: "Nebenfach"
+# WPU-Flag wird dynamisch erkannt
+SUBJECT_STATUS_CONFIG = {
+    # Hauptfächer (explizit)
+    "Deutsch": "Hauptfach",
+    "Mathematik": "Hauptfach",
+    "Englisch": "Hauptfach",
+    "Gesellschaftslehre": "Hauptfach",
+    
+    # Nebenfächer (explizit zur Sicherheit, aber Fallback ist Nebenfach)
+    "Französisch": "Nebenfach (WPU)",
+    "Spanisch": "Nebenfach (WPU)",
+    "Ethik": "Nebenfach",
+    "Religion": "Nebenfach",
+    "Religion (ev)": "Nebenfach",
+    "Religion (kath)": "Nebenfach",
+    "Kunst": "Nebenfach",
+    "Musik": "Nebenfach",
+    "Naturwissenschaften": "Nebenfach",
+    "Sport": "Nebenfach",
+    "Informatik": "Nebenfach (WPU)",
+    "Physik": "Nebenfach",
+    "Chemie": "Nebenfach",
+    "Biologie": "Nebenfach",
+    "Arbeitslehre": "Nebenfach",
+    "Praxistag": "Nebenfach",
+    "Holzbearbeitung": "Nebenfach (WPU)",
+    "Präsentationstechnik": "Nebenfach (WPU)",
+    "Ernährung": "Nebenfach (WPU)",
+    "Ernährung und Gesundheit": "Nebenfach (WPU)",
+    "Kraftsport": "Nebenfach (WPU)",
+    "Kreativ gestalten": "Nebenfach (WPU)",
+    "Textiles Gestalten": "Nebenfach (WPU)",
+}
+
+# WPU Fächer Muster (für automatische Erkennung)
+WPU_PATTERNS = ["WPU", "WPU1", "WPU2", "WP", "WP1", "WP2", "(W)"]
 
 class LinuxPathManager:
     """Linux-spezifische Pfad-Verwaltung"""
@@ -406,6 +472,7 @@ class KopfnotenImporter:
                 name TEXT NOT NULL,
                 klasse TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                target_subjects INTEGER, 
                 UNIQUE(name, klasse)
             );
 
@@ -438,6 +505,22 @@ class KopfnotenImporter:
             CREATE INDEX IF NOT EXISTS idx_schueler_klasse ON schueler(klasse);
             CREATE INDEX IF NOT EXISTS idx_noten_schueler ON noten(schueler_id);
             """
+        )
+        conn.commit()
+        
+        # MIGRATION: Check if target_subjects exists (for existing DBs)
+        try:
+            cursor = conn.execute("PRAGMA table_info(schueler)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if "target_subjects" not in columns:
+                conn.execute("ALTER TABLE schueler ADD COLUMN target_subjects INTEGER")
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Migration error (target_subjects): {e}")
+
+        # Migration: Geschichte/Gesellschaftskunde -> Gesellschaftslehre
+        conn.execute(
+            "UPDATE faecher SET fach_lang = 'Gesellschaftslehre' WHERE fach_lang IN ('Geschichte', 'Gesellschaftskunde')"
         )
         conn.commit()
         return conn
@@ -533,7 +616,7 @@ class KopfnotenImporter:
             (r"^WP\b", "WP"),
             (r"^WPU\b", "WPU"),
             (r"^W\b", "WP"),
-            (r"Ergänzung Praxistag", "Praxistag"),
+            (r"Praxistag", "Praxistag"),
             (r"\bWP1\b", "WP1"),
             (r"\bWP2\b", "WP2"),
             (r"\bWPU1\b", "WPU1"),
@@ -606,7 +689,13 @@ class KopfnotenImporter:
         klasse = (
             file_path.stem.split("_")[-1] if "_" in file_path.stem else file_path.stem
         )
-        self.logger.info(f"Importiere Datei: {file_path.name} (Klasse: {klasse})")
+        # Jahrgang extrahieren (z.B. "05a" -> 5)
+        jahrgang = None
+        jahr_match = re.search(r"(\d+)", klasse)
+        if jahr_match:
+            jahrgang = int(jahr_match.group(1))
+
+        self.logger.info(f"Importiere Datei: {file_path.name} (Klasse: {klasse}, Jahrgang: {jahrgang})")
         try:
             df = pd.read_excel(file_path, engine="openpyxl")
             if "Name" not in df.columns or "Art" not in df.columns:
@@ -620,12 +709,20 @@ class KopfnotenImporter:
 
             fach_columns_clean = []
             rel_count = 0
-            import re
+            
             
             for idx, col_name in fach_info:
                 # Column names only contain subject, teacher is in the cell value
                 fach_clean = str(col_name).strip()
                 
+                # BEREINIGUNG: Entferne Zusätze wie (U1), (U2), (U 1) etc.
+                # Regex: Sucht nach (U, gefolgt von Leerzeichen/Zahlen, Klammer zu) am Ende oder mittendrin
+                fach_clean = re.sub(r'\s*\(\s*U\s*\d+\s*\)', '', fach_clean, flags=re.IGNORECASE).strip()
+                
+                # TUT in 5/6 ignorieren
+                if jahrgang in [5, 6] and fach_clean.upper() == "TUT":
+                    continue
+
                 # Typ ermitteln
                 typ = None
                 if fach_clean == "Re":
@@ -656,6 +753,135 @@ class KopfnotenImporter:
                             "ist_wahlpflicht": ist_wahlpflicht,
                             "lehrer_kuerzel": lehrer_kuerzel
                         }
+
+            # --- Universelle Platzhalter-Logik ---
+            # 1. Nicht-Klassenverbands-Fächer nach Jahrgang definieren
+            non_class_band = {"Re", "Et", "Eth", "Ethik"}
+            if jahrgang and jahrgang >= 7:
+                non_class_band.update({"De", "Deu", "Deutsch", "Ma", "Mat", "Mathematik", "En", "Eng", "Englisch", "WPU1", "WP1"})
+            if jahrgang and jahrgang >= 9:
+                non_class_band.update({"WPU2", "WP2"})
+
+            # 2. Alle Fächer und Lehrer-Kürzel sammeln
+            klassen_faecher = {} # (kurz, typ) -> {kuerzel: count}
+            for schueler_data in schueler_noten.values():
+                for art in ["AV", "SV"]:
+                    for (f_k, f_t), data in schueler_data[art].items():
+                        if (f_k, f_t) not in klassen_faecher:
+                            klassen_faecher[(f_k, f_t)] = {}
+                        kuerzel = data.get("lehrer_kuerzel")
+                        if kuerzel:
+                            klassen_faecher[(f_k, f_t)][kuerzel] = klassen_faecher[(f_k, f_t)].get(kuerzel, 0) + 1
+            
+            # 3. Häufigstes Kürzel bestimmen (für Klassenverband-Zuweisung)
+            default_lehrer = {}
+            for f_key, counts in klassen_faecher.items():
+                if counts:
+                    default_lehrer[f_key] = max(counts, key=counts.get)
+                else:
+                    default_lehrer[f_key] = None
+            
+            # 3.b Aggressive Deduplizierung von Religion und Ethik BEVOR Platzhalter eingefügt werden
+            for name, data in schueler_noten.items():
+                # Wir prüfen AV und SV getrennt, aber meist sind keys identisch
+                for art in ["AV", "SV"]:
+                    entries = data[art]
+                    # Gruppiere Keys nach Fach-Typ (Religion oder Ethik) -> NUTZE MAPPING für Aliase (Re, Et, etc.)
+                    rel_keys = [k for k in entries.keys() if FAECHER_MAPPING.get(k[0], k[0]).startswith("Religion")]
+                    eth_keys = [k for k in entries.keys() if FAECHER_MAPPING.get(k[0], k[0]).startswith("Ethik")]
+                    all_rel_eth = rel_keys + eth_keys
+                    
+                    # Hilfsfunktion zum Bestimmen des besten Eintrags
+                    def get_best_key(keys, entries_dict):
+                        if not keys: return None
+                        # 1. Bevorzuge Eintrag mit Note
+                        for k in keys:
+                            if entries_dict[k]["note"] is not None:
+                                return k
+                        # 2. Bevorzuge Eintrag mit Lehrerkürzel
+                        for k in keys:
+                            if entries_dict[k]["lehrer_kuerzel"]:
+                                return k
+                        # 3. Nimm den ersten
+                        return keys[0]
+
+                    # Check if ANY Rel/Eth has a grade
+                    graded_keys = [k for k in all_rel_eth if entries[k]["note"] is not None]
+                    
+                    if graded_keys:
+                        # Wenn mindestens eine Note existiert, behalte NUR den besten benoteten Eintrag
+                        # Alle anderen (auch vom anderen Typ) werden gelöscht
+                        winner = get_best_key(graded_keys, entries)
+                        for k in all_rel_eth:
+                            if k != winner:
+                                del entries[k]
+                    else:
+                        # Keine Note vorhanden -> Wir wollen MAXIMAL 1x Religion und 1x Ethik als Platzhalter
+                        # Religion bereinigen
+                        if len(rel_keys) > 1:
+                            best_rel = get_best_key(rel_keys, entries)
+                            for k in rel_keys:
+                                if k != best_rel:
+                                    del entries[k]
+                        # Ethik bereinigen
+                        if len(eth_keys) > 1:
+                            best_eth = get_best_key(eth_keys, entries)
+                            for k in eth_keys:
+                                if k != best_eth:
+                                    del entries[k]
+
+                # 4. Fehlende Fächer ergänzen (Platzhalter)
+                # ACHTUNG: Wir müssen sicherstellen, dass wir nicht doppelt hinzufügen
+                for name_place, data_place in schueler_noten.items():
+                    # Checke aktuelle Fächer basierend auf den BEREINIGTEN Listen
+                    current_faecher_keys = set(data_place["AV"].keys()) | set(data_place["SV"].keys())
+                    # Normalisiere auch hier für den Check
+                    current_faecher_kurz = {FAECHER_MAPPING.get(k[0], k[0]) for k in current_faecher_keys}
+                    
+                    # Wenn weder Religion noch Ethik vorhanden sind, Platzhalter einfügen
+                    # Checke auf startswith("Religion") um auch Varianten zu fangen
+                    has_religion = any(f.startswith("Religion") for f in current_faecher_kurz)
+                    has_ethik = any(f.startswith("Ethik") for f in current_faecher_kurz)
+
+                    if not has_religion and not has_ethik:
+                        # Platzhalter für Religion
+                        rel_key = ("Religion", "evangelisch") 
+                        if rel_key not in data_place["AV"]:
+                            data_place["AV"][rel_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["SV"][rel_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                        # Platzhalter für Ethik
+                        eth_key = ("Ethik", None)
+                        if eth_key not in data_place["AV"]:
+                            data_place["AV"][eth_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["SV"][eth_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                        
+                        # Update local sets to prevent re-adding below
+                        current_faecher_kurz.add("Religion")
+                        current_faecher_kurz.add("Ethik")
+                        current_faecher_keys.add(rel_key)
+                        current_faecher_keys.add(eth_key)
+
+                    for f_key in default_lehrer:
+                        if f_key not in current_faecher_keys:
+                            # Religion/Ethik Sondermodus: Nicht doppelt einfügen
+                            norm_key = FAECHER_MAPPING.get(f_key[0], f_key[0])
+                            if norm_key.startswith("Religion") or norm_key.startswith("Ethik"):
+                                if has_religion or has_ethik or "Religion" in current_faecher_kurz or "Ethik" in current_faecher_kurz:
+                                    continue
+                            
+                            lehrer = default_lehrer[f_key]
+                            data_place["AV"][f_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
+                            data_place["SV"][f_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
+                            
+                            # Update local set
+                            current_faecher_keys.add(f_key)
+                            current_faecher_kurz.add(norm_key)
+
+                # Lehrer für bereits vorhandene Fächer ergänzen, falls dort fehlend
+                for art in ["AV", "SV"]:
+                    for f_key, f_data in data[art].items():
+                        if not f_data.get("lehrer_kuerzel") and f_key in default_lehrer:
+                            f_data["lehrer_kuerzel"] = default_lehrer[f_key]
 
             schueler_count = 0
             noten_count = 0
@@ -693,6 +919,7 @@ class KopfnotenImporter:
                         note_av is not None
                         or note_sv is not None
                         or ist_wahlpflicht_belegung
+                        or True # Immer Platzhalter erlauben
                     ):
                         cursor = self.conn.execute(
                             """SELECT noten_id FROM noten
@@ -738,6 +965,86 @@ class KopfnotenImporter:
             self.logger.error(f"Fehler beim Import von {file_path.name}: {str(e)}")
             self.conn.rollback()
             raise
+
+    def _clean_existing_subjects(self):
+        """Bereinigt nachträglich alle Fächer in der Datenbank von (U...)-Zusätzen."""
+        self.logger.info("Starte Datenbank-Bereinigung für Fächer-Namen...")
+        try:
+            # 1. Alle Fächer laden
+            cursor = self.conn.execute("SELECT fach_id, fach_kurz, fach_lang, fach_typ, wahlpflicht_gruppe FROM faecher")
+            all_subjects = cursor.fetchall()
+            
+            changes_count = 0
+            
+            for subj in all_subjects:
+                s_id = subj[0]
+                s_kurz = subj[1]
+                s_lang = subj[2]
+                s_typ = subj[3]
+                s_wp_gruppe = subj[4]
+
+                # Check Regex
+                clean_lang = re.sub(r'\s*\(\s*U\s*\d+\s*\)', '', s_lang, flags=re.IGNORECASE).strip()
+                
+                # Wenn Änderung nötig ist
+                if clean_lang != s_lang:
+                    clean_kurz = re.sub(r'\s*\(\s*U\s*\d+\s*\)', '', s_kurz, flags=re.IGNORECASE).strip()
+                    
+                    self.logger.info(f"Bereinige Fach: ID {s_id} '{s_lang}' -> '{clean_lang}'")
+                    
+                    # Prüfen: Gibt es das Clean-Fach schon?
+                    # Achtung: Check muss auch Typ/Gruppe berücksichtigen, damit wir nicht Äpfel mit Birnen mergen.
+                    # Aber in diesem Fall wollen wir ja gerade das "Praxistag (U1)" mit "Praxistag" mergen.
+                    # Wir nehmen an, dass Typ/Gruppe identisch sein sollten oder vom Ziel übernommen werden.
+                    
+                    target_cursor = self.conn.execute(
+                        """SELECT fach_id FROM faecher 
+                           WHERE fach_lang = ? AND (fach_typ = ? OR (fach_typ IS NULL AND ? IS NULL))
+                           AND (wahlpflicht_gruppe = ? OR (wahlpflicht_gruppe IS NULL AND ? IS NULL))""",
+                        (clean_lang, s_typ, s_typ, s_wp_gruppe, s_wp_gruppe)
+                    )
+                    target_res = target_cursor.fetchone()
+                    
+                    if target_res:
+                        # MERGE: Ziel existiert schon
+                        target_id = target_res[0]
+                        if target_id == s_id:
+                            continue # Sollte nicht passieren, aber sicher ist sicher
+
+                        self.logger.info(f"  -> Merge zu existierendem Fach ID {target_id}")
+
+                        # 1. Update Noten: Setze fach_id auf target_id
+                        # Konfliktlösung: IGNORE (falls Note für target_id im gleichen Halbjahr schon existiert -> behalte target_note)
+                        self.conn.execute(
+                            "UPDATE OR IGNORE noten SET fach_id = ? WHERE fach_id = ?",
+                            (target_id, s_id)
+                        )
+                        
+                        # 2. Lösche restliche Noten für s_id (die Duplikate wären und daher ignoriert wurden)
+                        self.conn.execute("DELETE FROM noten WHERE fach_id = ?", (s_id,))
+                        
+                        # 3. Lösche das alte Fach
+                        self.conn.execute("DELETE FROM faecher WHERE fach_id = ?", (s_id,))
+                        
+                    else:
+                        # RENAME: Ziel existiert noch nicht -> einfach umbenennen
+                        self.logger.info(f"  -> Umbenennung zu '{clean_lang}'")
+                        self.conn.execute(
+                            "UPDATE faecher SET fach_lang = ?, fach_kurz = ? WHERE fach_id = ?",
+                            (clean_lang, clean_kurz, s_id)
+                        )
+                    
+                    changes_count += 1
+                    
+            if changes_count > 0:
+                self.conn.commit()
+                self.logger.info(f"Bereinigung abgeschlossen. {changes_count} Fächer aktualisiert/gemerged.")
+            else:
+                self.logger.info("Keine bereinigungsbedürftigen Fächer gefunden.")
+                
+        except Exception as e:
+            self.logger.error(f"Fehler bei der Datenbank-Bereinigung: {e}")
+            self.conn.rollback() # Rollback safe
 
 class OptimizedKopfnotenExporter:
     """Optimierter Exporter für horizontale 3-Zeilen-Tabellen mit korrekter erster Spalte"""
@@ -839,77 +1146,157 @@ class OptimizedKopfnotenExporter:
         """Zentrale Logik für Fächer-Filterung, Formatierung und Sortierung"""
         regular_subjects = []
         wp_subjects = []
-
+        
+        # Triaden-Status
+        triad_grades = {} # name -> {av, sv}
+        wpu_graded_list = [] # Liste der benoteten WPU-Fächer
+        
+        processed_rows = []
         for row in rows:
-            # Convert row to dict for easier access (sqlite3.Row doesn't have .get())
             row_dict = dict(row)
             original_fach_lang = row_dict["fach_lang"]
+            fach_kurz = row_dict.get("fach_kurz")
+            fach_typ = row_dict.get("fach_typ")
             
             # Canonical name lookup
             fach_lang = FAECHER_MAPPING.get(original_fach_lang, original_fach_lang)
             
             is_wp = bool(row_dict.get("ist_wahlpflicht_belegung", 0))
             wp_gruppe = row_dict.get("wahlpflicht_gruppe")
+            
+            av_val = row_dict["note_av"]
+            sv_val = row_dict["note_sv"]
+            av_note = str(av_val) if av_val is not None else "-"
+            sv_note = str(sv_val) if sv_val is not None else "-"
 
-            # Noten formatieren
-            av_note = str(row_dict["note_av"]) if row_dict["note_av"] is not None else "-"
-            sv_note = str(row_dict["note_sv"]) if row_dict["note_sv"] is not None else "-"
+            is_rel_triad = (fach_kurz == "Ethik") or (fach_kurz == "Religion" and fach_typ in ["evangelisch", "katholisch"])
+            
+            config_status = SUBJECT_STATUS_CONFIG.get(fach_lang, "")
+            is_wpu_config = "WPU" in config_status
+            is_wpu = is_wp or any(p in (wp_gruppe or "") for p in ["WPU", "WP"]) or is_wpu_config
 
-            if is_wp:
+            if is_rel_triad and (av_val or sv_val):
+                triad_grades[fach_lang] = {"av": av_note, "sv": sv_note}
+            if is_wpu and (av_val or sv_val):
+                if fach_lang not in wpu_graded_list:
+                    wpu_graded_list.append(fach_lang)
+
+            processed_rows.append({
+                "fach_lang": fach_lang,
+                "fach_kurz": fach_kurz,
+                "fach_typ": fach_typ,
+                "is_wp": is_wp,
+                "is_wpu": is_wpu,
+                "is_rel_triad": is_rel_triad,
+                "av_note": av_note,
+                "sv_note": sv_note,
+                "wp_gruppe": wp_gruppe
+            })
+
+        # Triaden-Sicherstellung
+        triad_names = ["Ethik", "Religion (ev)", "Religion (kath)"]
+        
+        # WPU Limit ermitteln
+        wpu_limit = 2 if jahrgang and jahrgang >= 9 else 1
+        
+        # Determine allowed WPUs (Top N graded ones)
+        # Sort key could be added here if needed, currently implicit by encounter order or alphabetic?
+        # Better sort alphabetically to be deterministic
+        wpu_graded_list.sort()
+        allowed_wpus = wpu_graded_list[:wpu_limit]
+        
+        final_rows = []
+        for p_row in processed_rows:
+            keep_row = True
+            
+            if p_row["is_rel_triad"]:
+                # Logic logic for Triad (stays same: "/" if other has grade)
+                has_any_triad_grade = bool(triad_grades)
+                if has_any_triad_grade and p_row["fach_lang"] not in triad_grades:
+                     p_row["av_note"] = "/"
+                     p_row["sv_note"] = "/"
+            
+            elif p_row["is_wpu"]:
+                # WPU-Ausschluss basierend auf Limit:
+                # Wir behalten NUR die Fächer, die in `allowed_wpus` sind.
+                # Alles andere (z.B. Ungradierte WPU Platzhalter oder überschüssige) FLIEGT RAUS. (nicht nur "/")
+                # Außer wir haben GAR KEINE Noten (wpu_graded_list ist leer).
+                
+                if allowed_wpus:
+                    if p_row["fach_lang"] not in allowed_wpus:
+                        keep_row = False
+                else:
+                    # Wenn keine WPU Noten da sind -> Ungradierte placeholders rausnehmen
+                    if p_row["av_note"] == "-" and p_row["sv_note"] == "-":
+                        keep_row = False
+
+            if keep_row:
+                final_rows.append(p_row)
+        
+        # Output Lists preparation
+        # Wir müssen die final_rows nun in regular_subjects und wp_subjects aufteilen für den Docx Export
+        
+        for p_row in final_rows:
+            fach_lang = p_row["fach_lang"]
+            av_note = p_row["av_note"]
+            sv_note = p_row["sv_note"]
+            
+            # Skip if filtered (should be handled by final_rows, but check for safety)
+            
+            if p_row["is_wpu"]:
                 # WPU-Logik nach Jahrgang
                 if jahrgang in [5, 6]:
-                    # In 5/6 kein WPU -> als normales Fach behandeln
-                    regular_subjects.append({
-                        "display": fach_lang,
-                        "av": av_note,
-                        "sv": sv_note
-                    })
+                     regular_subjects.append({"display": fach_lang, "av": av_note, "sv": sv_note})
                 elif jahrgang in [7, 8]:
-                    # In 7/8 alle WP als WPU1
                     wp_subjects.append({
-                        "display": f"{fach_lang} (WPU1)",
+                        "display": f"{fach_lang} (WPU1)", # Exportiert mit Suffix (WPU1)
                         "av": av_note,
                         "sv": sv_note,
                         "sort_key": (1, fach_lang)
                     })
                 elif jahrgang in [9, 10]:
-                    # In 9/10 WPU1 und WPU2 unterscheiden, Fallback auf WPU1
-                    best_group = "WPU2" if (wp_gruppe and "2" in str(wp_gruppe)) else "WPU1"
+                    # determine group
+                    best_group = "WPU2" if (p_row["wp_gruppe"] and "2" in str(p_row["wp_gruppe"])) else "WPU1"
+                    # IF we have 2, logic ensures they are both allowed.
+                    # We need to ensure we don't map both to WPU1 if they are distinct.
+                    # The `allowed_wpus` list maintains order.
+                    # Simple heuristic: first in list is WPU1, second is WPU2.
+                    
+                    try:
+                        idx = wpu_graded_list.index(fach_lang)
+                        best_group = "WPU1" if idx == 0 else "WPU2"
+                    except ValueError:
+                        pass # keep default
+                        
                     wp_subjects.append({
-                        "display": f"{fach_lang} ({best_group})",
+                        "display": f"{fach_lang} ({best_group})", # Suffix (WPU1) oder (WPU2)
                         "av": av_note,
                         "sv": sv_note,
+                        "group": best_group, 
                         "sort_key": (1 if best_group == "WPU1" else 2, fach_lang)
                     })
                 else:
-                    # Andere Jahrgänge: Standardmäßig als Regelfach
-                    regular_subjects.append({
-                        "display": fach_lang,
-                        "av": av_note,
-                        "sv": sv_note
-                    })
+                    regular_subjects.append({"display": fach_lang, "av": av_note, "sv": sv_note})
             else:
-                regular_subjects.append({
-                    "display": fach_lang,
-                    "av": av_note,
-                    "sv": sv_note
-                })
+                regular_subjects.append({"display": fach_lang, "av": av_note, "sv": sv_note})
 
         # Sortierung
         priority = {
             "Deutsch": 1,
             "Mathematik": 2,
             "Englisch": 3,
-            "Gesellschaftskunde": 4
+            "Gesellschaftslehre": 4, # Korrigiert von Gesellschaftskunde
+            "Ethik": 20,
+            "Religion (ev)": 21,
+            "Religion (kath)": 22
         }
 
         def regular_sort_key(item):
             name = item["display"]
-            # Priorität 1-4 für Hauptfächer, danach 10 + Name für den Rest
-            return (priority.get(name, 10), name)
+            return (priority.get(name, 100), name)
 
         regular_subjects.sort(key=regular_sort_key)
-        wp_subjects.sort(key=lambda x: x["sort_key"])
+        wp_subjects.sort(key=lambda x: x.get("sort_key", (10, x["display"])))
 
         all_entries = regular_subjects + wp_subjects
         
@@ -941,20 +1328,21 @@ class OptimizedKopfnotenExporter:
             shutil.copy2(template_path, temp_template)
             self.logger.info(f"Template copied to temp directory, size: {temp_template.stat().st_size} bytes")
             
-            # Modify the template to include dynamic table creation code
-            self._prepare_dynamic_template(temp_template)
-            
             # Change to temp directory
             os.chdir(temp_dir)
             self.logger.info(f"Changed working directory to: {temp_dir}")
+            
+            # Modify the template to include dynamic table creation code and get buffer
+            # Decoupled approach: python-docx modifies -> buffer -> docxtpl reads buffer
+            template_buffer = self._prepare_dynamic_template(temp_template)
             
             # Generate template filename with timestamp to avoid conflicts
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_docxtpl = f"temp_template_{timestamp}.docx"
             
-            # Initialize DocxTemplate
-            template = DocxTemplate(str(temp_template))
-            self.logger.info(f"DocxTemplate initialized with: {temp_docxtpl}")
+            # Initialize DocxTemplate with the buffer
+            template = DocxTemplate(template_buffer)
+            self.logger.info(f"DocxTemplate initialized with memory buffer")
             
             # Render template with context
             template.render(context)
@@ -982,22 +1370,21 @@ class OptimizedKopfnotenExporter:
             except Exception as cleanup_error:
                 self.logger.warning(f"Warning during cleanup: {cleanup_error}")
                 
-    def _prepare_dynamic_template(self, template_path: Path) -> None:
-        """Modifies the template file to include dynamic table creation code
-        
-        This function adds Jinja2 code that will create a table with exactly
-        the number of columns needed for each student's subjects, while 
-        maintaining a fixed total table width.
+    def _prepare_dynamic_template(self, template_path: Path) -> io.BytesIO:
+        """Modifies the template file to include dynamic code and returns a BytesIO buffer
         
         Args:
             template_path: Path to the template file
+            
+        Returns:
+            io.BytesIO: Buffer containing the modified docx file
         """
         try:
             from docx import Document
-            from docx.oxml.parser import parse_xml
             from docx.shared import Inches
+            import io
             
-            # Read the template as a docx file
+            # Read the template as a docx file using python-docx
             doc = Document(template_path)
             
             # Find paragraphs containing the placeholder
@@ -1034,9 +1421,13 @@ class OptimizedKopfnotenExporter:
 """)
                     break
             
-            # Save the modified template
-            doc.save(template_path)
-            self.logger.info(f"Template modified to include dynamic table creation: {template_path}")
+            # Save the modified template to a BytesIO buffer
+            buffer = io.BytesIO()
+            doc.save(buffer)
+            buffer.seek(0)
+            
+            self.logger.info(f"Template modified in-memory and saved to buffer")
+            return buffer
             
         except Exception as e:
             self.logger.error(f"Error preparing dynamic template: {e}")
@@ -1302,25 +1693,61 @@ class OptimizedKopfnotenExporter:
 
 class SimplifiedGradeEditor:
     """Vereinfachter Noten-Editor"""
-    def __init__(self, parent, db_path: str):
-        self.parent = parent
+    def __init__(self, master_widget, db_path: str):
+        self.master_widget = master_widget
+        self.app = None # Reference to main application for callbacks
         self.db_path = db_path
         self.logger = logging.getLogger("grade_editor")
 
-    def open_grade_editor(self, student_id: int, student_name: str, student_class: str):
-        """Öffnet vereinfachten Noten-Editor"""
+    def open_grade_editor(self, student_id: int, student_name: str, student_class: str, student_context_list: List[Dict] = None):
+        """Öffnet den Editor für einen Schüler"""
         try:
-            # Editor-Fenster erstellen
-            editor_window = tk.Toplevel(self.parent)
-            editor_window.title(f"Noten bearbeiten - {student_name} ({student_class})")
-            editor_window.geometry("800x600")
-            editor_window.resizable(True, True)
-            # Header
+            # Fenster erstellen (oder wiederverwenden falls wir Navigation machen?)
+            # Wir erstellen es neu für Clean State, aber idealerweise Reuse.
+            # Navigation Logic: Wenn das Fenster schon offen ist -> Reuse?
+            # Einfachste Lösung: Fenster clean neu bauen.
+            
+            editor_window = tk.Toplevel(self.master_widget)
+            editor_window.title(f"Noten bearbeiten: {student_name} ({student_class})")
+            editor_window.geometry("900x700")
+            
+            # --- Navigation Frame (Top) ---
+            if student_context_list:
+                nav_frame = ttk.Frame(editor_window)
+                nav_frame.pack(fill=tk.X, padx=10, pady=5)
+                
+                # Find current index
+                current_idx = -1
+                for i, s in enumerate(student_context_list):
+                    if str(s["id"]) == str(student_id):
+                        current_idx = i
+                        break
+                
+                def navigate(delta):
+                    new_idx = current_idx + delta
+                    if 0 <= new_idx < len(student_context_list):
+                        next_student = student_context_list[new_idx]
+                        editor_window.destroy()
+                        self.open_grade_editor(next_student["id"], next_student["name"], next_student["klasse"], student_context_list)
+                
+                # Buttons
+                btn_prev = ttk.Button(nav_frame, text="<< Vorheriger", command=lambda: navigate(-1), state=tk.NORMAL if current_idx > 0 else tk.DISABLED)
+                btn_prev.pack(side=tk.LEFT)
+                
+                ttk.Label(nav_frame, text=f"{current_idx+1} / {len(student_context_list)}").pack(side=tk.LEFT, padx=10)
+                
+                btn_next = ttk.Button(nav_frame, text="Nächster >>", command=lambda: navigate(1), state=tk.NORMAL if current_idx < len(student_context_list)-1 else tk.DISABLED)
+                btn_next.pack(side=tk.RIGHT)
+
+            
+            
+            # Header Frame
             header_frame = ttk.Frame(editor_window)
             header_frame.pack(fill=tk.X, padx=10, pady=5)
-            ttk.Label(
+
+            tk.Label(
                 header_frame,
-                text=f"Schüler: {student_name}",
+                text=f"Noten für {student_name}",
                 font=("Arial", 14, "bold"),
             ).pack(side=tk.LEFT)
             ttk.Label(
@@ -1333,10 +1760,137 @@ class SimplifiedGradeEditor:
 
             # Lade aktuelle Noten
             grades_data = self._load_student_grades(student_id)
+            
+            # Jahrgang ermitteln
+            match = re.search(r'(\d+)', student_class)
+            jahrgang = int(match.group(1)) if match else 0
+
+            # WPU Target Limit bestimmen
+            wpu_target = 0
+            if jahrgang in [7, 8]:
+                wpu_target = 1
+            elif jahrgang in [9, 10]:
+                wpu_target = 2
+            
+            # --- BACKFILLING: Fehlende reguläre Fächer ergänzen ---
+            # Ermittle alle regulären Fächer der Klasse (Präziser als Jahrgang)
+            # Delegate to main app
+            if self.app:
+                regular_subjects_metadata = self.app._get_class_regular_subjects(student_class)
+            else:
+                 self.logger.warning("No app reference in Editor, cannot backfill regular subjects")
+                 regular_subjects_metadata = {}
+            
+            # Welche Fächer hat der Schüler bereits?
+            existing_subjects_set = set(g["fach_lang"] for g in grades_data)
+            for subj_name, subj_id in regular_subjects_metadata.items():
+                # Exclude Ethik/Religion from generic backfilling (handled by Triad logic)
+                if subj_name in ["Ethik", "Religion", "Religion evangelisch", "Religion katholisch"]:
+                    continue
+                    
+                if subj_name not in existing_subjects_set:
+                    # Placeholder hinzufügen
+                    # Wir brauchen eine Dummy-ID und Standardwerte
+                    new_placeholder = {
+                        "noten_id": f"missing_{subj_name}", # Virtuelle ID
+                        "fach_id": subj_id, # Real ID from metadata!
+                        "fach_lang": subj_name,
+                        "fach_kurz": subj_name[:3].upper(), # Generiert
+                        "note_av": None,
+                        "note_sv": None,
+                        "ist_wahlpflicht_belegung": 0,
+                        "ist_wahlpflicht": 0,
+                        "wahlpflicht_gruppe": None,
+                        "lehrer_kuerzel": "",
+                        "is_placeholder": True
+                    }
+                    grades_data.append(new_placeholder)
+                    existing_subjects_set.add(subj_name)
+            # -----------------------------------------------------
+            # Zähle bereits BENOTETE WPU-Fächer des Schülers
+            graded_wpu_count = 0
+            existing_wpu_subjects = set()
+            
+            for g in grades_data:
+                # Prüfe ob WPU (Config oder Flag)
+                status_check = SUBJECT_STATUS_CONFIG.get(g["fach_lang"], "")
+                is_wpu_config = "WPU" in status_check
+                is_wpu_db = bool(g["ist_wahlpflicht_belegung"]) or bool(g["ist_wahlpflicht"]) or (g["wahlpflicht_gruppe"] and "WP" in str(g["wahlpflicht_gruppe"]))
+                
+                is_wpu = is_wpu_config or is_wpu_db
+                
+                if is_wpu:
+                    existing_wpu_subjects.add(g["fach_lang"])
+                    # Zählt nur wenn Note vorhanden
+                    if g["note_av"] is not None or g["note_sv"] is not None:
+                        graded_wpu_count += 1
+            
+            # Wenn WPU-Ziel NOCH NICHT erreicht ist -> Platzhalter anzeigen
+            if graded_wpu_count < wpu_target:
+                # Lade mögliche WPU-Fächer der Klasse und merge sie ein
+                if self.app:
+                    class_wpu = self.app._get_class_wpu_subjects(student_class)
+                else:
+                    class_wpu = []
+                
+                for wpu in class_wpu:
+                    # Prüfe auch via Config
+                    status_check = SUBJECT_STATUS_CONFIG.get(wpu["fach_lang"], "")
+                    is_wpu_config = "WPU" in status_check
+                    is_wpu_db = wpu["ist_wahlpflicht"] or (wpu["wahlpflicht_gruppe"] and "WP" in wpu["wahlpflicht_gruppe"])
+                    
+                    # Wenn valides WPU Fach und noch nicht beim Schüler vorhanden
+                    if (is_wpu_config or is_wpu_db) and wpu["fach_lang"] not in existing_wpu_subjects:
+                        # Dummy Entry erstellen
+                        dummy_entry = {
+                            "noten_id": f"new_wpu_{wpu['fach_kurz']}", 
+                            "fach_id": wpu["fach_id"], 
+                            "fach_lang": wpu["fach_lang"],
+                            "fach_kurz": wpu["fach_kurz"],
+                            "note_av": None,
+                            "note_sv": None,
+                            "ist_wahlpflicht_belegung": 0, 
+                            "ist_wahlpflicht": 1,
+                            "wahlpflicht_gruppe": wpu["wahlpflicht_gruppe"],
+                            "lehrer_kuerzel": wpu["lehrer_kuerzel"], 
+                            "is_placeholder": True 
+                        }
+                        grades_data.append(dummy_entry)
+            else:
+                # WPU-Ziel erreicht (oder überschritten):
+                # Wir müssen UNBENOTETE WPU-Einträge aus der Liste entfernen, damit sie nicht angezeigt werden.
+                # Das bereinigt die Ansicht von "Leichen" (importierte leere Spalten oder zuvor angelegte Platzhalter).
+                
+                cleaned_grades = []
+                for g in grades_data:
+                    # Prüfe ob WPU
+                    status_check = SUBJECT_STATUS_CONFIG.get(g["fach_lang"], "")
+                    is_wpu_config = "WPU" in status_check
+                    is_wpu_db = bool(g["ist_wahlpflicht_belegung"]) or bool(g["ist_wahlpflicht"]) or (g["wahlpflicht_gruppe"] and "WP" in str(g["wahlpflicht_gruppe"]))
+                    is_wpu = is_wpu_config or is_wpu_db
+                    
+                    # Behalten wenn:
+                    # - KEIN WPU Fach (reguläres Fach)
+                    # - ODER WPU Fach mit Note
+                    # - ODER WPU Fach ist Teil der benoteten (graded_wpu_count zählt ja nur Noten, aber vielleicht will man das Fach behalten?)
+                    #   Eigentlich: Wenn unbenotet und WPU -> Weg.
+                    
+                    has_grade = g["note_av"] is not None or g["note_sv"] is not None
+                    
+                    if not is_wpu:
+                        cleaned_grades.append(g)
+                    elif has_grade:
+                         cleaned_grades.append(g)
+                    # else: skip (hide)
+                
+                grades_data = cleaned_grades
+            
+            # Sortieren nach Fachname
+            grades_data.sort(key=lambda x: x["fach_lang"])
 
             # Erstelle Eingabefelder
             self._create_grade_inputs(
-                notes_frame, grades_data, student_id, editor_window
+                notes_frame, grades_data, student_id, student_class, editor_window
             )
         except Exception as e:
             self.logger.error(f"Fehler beim Öffnen des Noten-Editors: {e}")
@@ -1371,8 +1925,10 @@ class SimplifiedGradeEditor:
             self.logger.error(f"Fehler beim Laden der Noten: {e}")
             return []
 
+
+
     def _create_grade_inputs(
-        self, parent_frame, grades_data: List[Dict], student_id: int, editor_window
+        self, parent_frame, grades_data: List[Dict], student_id: int, student_class: str, editor_window
     ):
         """Erstellt Eingabefelder für Noten"""
         # Scrollbares Frame Setup
@@ -1392,7 +1948,7 @@ class SimplifiedGradeEditor:
         scrollbar.pack(side="right", fill="y")
 
         # Header für die Eingabefelder
-        headers = ["Fach", "Lehrkraft", "AV-Note (1-6)", "SV-Note (1-6)", "WP"]
+        headers = ["Fach", "Lehrkraft", "AV-Note (1-6)", "SV-Note (1-6)", "Status"]
         for i, header in enumerate(headers):
             ttk.Label(scrollable_frame, text=header, font=("Arial", 10, "bold")).grid(
                 row=0, column=i, padx=10, pady=5, sticky=tk.W
@@ -1400,11 +1956,56 @@ class SimplifiedGradeEditor:
 
         # Daten einfügen
         grade_vars = {}
+        triad_vars = []
+        wpu_vars = []
+        
+        
+        # Helper for Subject Status
         for row_idx, grade in enumerate(grades_data, start=1):
+            # Fachname bereinigen (WP-Kürzel entfernen, U1/U2 entfernen)
             fach_name = grade["fach_lang"]
-            if grade["wahlpflicht_gruppe"]:
-                fach_name += f" ({grade['wahlpflicht_gruppe']})"
+            fach_name = re.sub(r"\s*\(WP\d*\)\s*$", "", fach_name)
+            # Robustere Regex für (U1), (U 12) etc.
+            fach_name = re.sub(r'\s*\(\s*U\s*\d+\s*\)', '', fach_name, flags=re.IGNORECASE).strip()
+            fach_name = fach_name.strip()
             
+            # Lehrer (nur Info)
+            lehrer = grade.get("lehrer_kuerzel") or "-"
+            
+            # IDs handlen (New vs Existing)
+            noten_id = grade["noten_id"]
+            is_placeholder = grade.get("is_placeholder", False)
+            fach_kurz = grade.get("fach_kurz")
+            fach_typ = grade.get("fach_typ")
+            
+            # ... rest logic ...
+            if grade["wahlpflicht_gruppe"]:
+                # Auch hier WP-Bezüge in Klammern entfernen, falls vorhanden
+                wp_grp = re.sub(r"WP\d*", "", str(grade['wahlpflicht_gruppe'])).strip(" ()")
+                if wp_grp:
+                    fach_name += f" ({wp_grp})"
+            
+            # WPU detection
+            is_wp = bool(grade["ist_wahlpflicht_belegung"]) or bool(grade["ist_wahlpflicht"]) or any(p in (grade["wahlpflicht_gruppe"] or "") for p in ["WPU", "WP"])
+
+            # Subject Status Text
+            # Nutze FAECHER_MAPPING um den kanonischen Namen zu prüfen
+            # grade["fach_lang"] ist der Name aus der DB (evtl importiert)
+            # Wir nutzen den cleanen Namen für den Check
+            clean_name = re.sub(r"\s*\(WP\d*\)\s*$", "", grade["fach_lang"])
+            canonical_name = FAECHER_MAPPING.get(clean_name, clean_name)
+            
+            status_text = "Nebenfach"
+            
+            # Lookup in SUBJECT_STATUS_CONFIG
+            if canonical_name in SUBJECT_STATUS_CONFIG:
+                 status_text = SUBJECT_STATUS_CONFIG[canonical_name]
+            # Fallback für Namen die nicht im Mapping sind, aber vielleicht "Hauptfach" sein sollen?
+            # Für jetzt: Default "Nebenfach" ist OK.
+            
+            if is_wp and "WPU" not in status_text:
+                status_text += " (WPU)"
+
             # Fach Name
             ttk.Label(scrollable_frame, text=fach_name).grid(row=row_idx, column=0, padx=10, pady=2, sticky=tk.W)
             
@@ -1422,19 +2023,81 @@ class SimplifiedGradeEditor:
             sv_entry = ttk.Entry(scrollable_frame, textvariable=sv_var, width=5)
             sv_entry.grid(row=row_idx, column=3, padx=10, pady=2)
             
-            # Wahlpflicht
-            # Haken setzen wenn entweder global am Fach ODER spezifisch an der Note
-            is_wp = bool(grade["ist_wahlpflicht_belegung"]) or bool(grade["ist_wahlpflicht"])
-            wp_var = tk.BooleanVar(value=is_wp)
-            wp_check = ttk.Checkbutton(scrollable_frame, variable=wp_var)
-            wp_check.grid(row=row_idx, column=4, padx=10, pady=2)
+            # Status Label instead of Checkbox
+            ttk.Label(scrollable_frame, text=status_text).grid(row=row_idx, column=4, padx=10, pady=2, sticky=tk.W)
             
-            grade_vars[grade["noten_id"]] = {
+            vars_data = {
+                "noten_id": grade["noten_id"],
                 "av_var": av_var,
                 "sv_var": sv_var,
-                "wp_var": wp_var,
-                "fach_name": fach_name
+                "av_entry": av_entry,
+                "sv_entry": sv_entry,
+                "fach_name": fach_name,
+
+                "fach_kurz": fach_kurz,
+                "fach_typ": fach_typ,
+                "fach_id": grade.get("fach_id"), # Optional, für New WPU
+                "ist_wpu": is_wp,
+                "lehrer_kuerzel_hint": grade.get("lehrer_kuerzel") # Für Insert benötigt
             }
+            grade_vars[grade["noten_id"]] = vars_data
+            
+            # Zu Gruppen hinzufügen
+            if (fach_kurz == "Ethik") or (fach_kurz == "Religion" and fach_typ in ["evangelisch", "katholisch"]):
+                triad_vars.append(vars_data)
+            elif vars_data["ist_wpu"]:
+                wpu_vars.append(vars_data)
+
+        # Traces für gegenseitigen Ausschluss
+        def update_exclusion_triad(group_vars):
+            # Religion/Ethik: Max 1 Note (AV oder SV) insgesamt in der Gruppe
+            any_filled = False
+            filled_id = None
+            for v in group_vars:
+                if v["av_var"].get().strip() or v["sv_var"].get().strip():
+                    any_filled = True
+                    filled_id = v["noten_id"]
+                    # Sobald einer befüllt ist, brauchen wir nicht weiter suchen
+                    break
+            
+            for v in group_vars:
+                # Disable if limit reached AND this one is not yet filled
+                state = "disabled" if (any_filled and v["noten_id"] != filled_id) else "normal"
+                v["av_entry"].config(state=state)
+                v["sv_entry"].config(state=state)
+
+        def update_exclusion_wpu(group_vars, student_class):
+            # WPU: 7-8 -> 1 Note, 9-10 -> 2 Noten
+            match_year = re.search(r"(\d+)", student_class)
+            jahrgang = int(match_year.group(1)) if match_year else 0
+            limit = 2 if jahrgang >= 9 else 1
+            
+            filled_vars = [v for v in group_vars if v["av_var"].get().strip() or v["sv_var"].get().strip()]
+            
+            for v in group_vars:
+                # Disable if limit reached AND this one is not yet filled
+                is_filled = v in filled_vars
+                if len(filled_vars) >= limit and not is_filled:
+                    state = "disabled"
+                else:
+                    state = "normal"
+                v["av_entry"].config(state=state)
+                v["sv_entry"].config(state=state)
+
+        # Traces aufsetzen
+        if triad_vars:
+            callback_triad = lambda *args: update_exclusion_triad(triad_vars)
+            for v in triad_vars:
+                v["av_var"].trace_add("write", callback_triad)
+                v["sv_var"].trace_add("write", callback_triad)
+            update_exclusion_triad(triad_vars)
+
+        if wpu_vars:
+            callback_wpu = lambda *args: update_exclusion_wpu(wpu_vars, student_class)
+            for v in wpu_vars:
+                v["av_var"].trace_add("write", callback_wpu)
+                v["sv_var"].trace_add("write", callback_wpu)
+            update_exclusion_wpu(wpu_vars, student_class)
 
         # Buttons (im editor_window, nicht im scrollable_frame)
         button_frame = ttk.Frame(editor_window)
@@ -1448,7 +2111,6 @@ class SimplifiedGradeEditor:
                     for noten_id, vars_dict in grade_vars.items():
                         av_text = vars_dict["av_var"].get().strip()
                         sv_text = vars_dict["sv_var"].get().strip()
-                        wp_value = vars_dict["wp_var"].get()
 
                         # Validiere und konvertiere Noten
                         av_value = None
@@ -1473,16 +2135,45 @@ class SimplifiedGradeEditor:
                             except ValueError:
                                 raise ValueError(f"Ungültige SV-Note für {vars_dict['fach_name']}")
 
+                        # WPU-Status automatisch setzen:
+                        # Wenn Fach WPU-fähig ist UND eine Note hat, ist es gewählt.
+                        wp_value = vars_dict.get("ist_wpu", False) and (av_value is not None or sv_value is not None)
+
                         # Speichere in Datenbank
-                        conn.execute(
-                            """
-                            UPDATE noten
-                            SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?
-                            WHERE noten_id = ?
-                            """,
-                            (av_value, sv_value, wp_value, noten_id),
-                        )
-                        saved_count += 1
+                        if str(noten_id).startswith("new_wpu_") or str(noten_id).startswith("missing_"):
+                             # INSERT Logic für neue WPU Platzhalter UND Missing Regular Placeholder
+                             # ACHTUNG: Wir brauchen die fach_id !
+                             # Das ist etwas tricky, da wir die hier nicht haben direkt.
+                             # Aber wir haben fach_kurz und fach_lang.
+                             
+                             # Nur speichern, wenn auch wirklich was eingetragen wurde!
+                             if av_value is None and sv_value is None:
+                                 continue
+                             
+                             fach_id_target = vars_dict.get("fach_id")
+                             if fach_id_target:
+                                 conn.execute(
+                                    """
+                                    INSERT INTO noten (schueler_id, fach_id, note_av, note_sv, ist_wahlpflicht_belegung, lehrer_kuerzel)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    """,
+                                    (student_id, fach_id_target, av_value, sv_value, wp_value, vars_dict.get("lehrer_kuerzel_hint"))
+                                 )
+                                 saved_count += 1
+                             else:
+                                 # Fallback falls fach_id fehlt (sollte nicht passieren)
+                                 self.logger.error(f"Fehler: Keine fach_id für neuen WPU Eintrag {vars_dict['fach_name']}")
+                        else:
+                            # Normal UPDATE
+                            conn.execute(
+                                """
+                                UPDATE noten
+                                SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?
+                                WHERE noten_id = ?
+                                """,
+                                (av_value, sv_value, wp_value, noten_id),
+                            )
+                            saved_count += 1
 
                     conn.commit()
                     messagebox.showinfo(
@@ -1491,8 +2182,11 @@ class SimplifiedGradeEditor:
                     editor_window.destroy()
 
                     # Refresh parent window
-                    if self.parent and hasattr(self.parent, "refresh_analysis_data"):
-                        self.parent.refresh_analysis_data()
+                    if self.app and hasattr(self.app, "refresh_analysis_data"):
+                        self.app.refresh_analysis_data()
+                        # Also refresh tree selection to keep context if possible?
+                        # Re-selecting might be tricky if list rebuilt.
+                        # Maybe we can just stay silent.
             except ValueError as e:
                 messagebox.showerror("Eingabefehler", str(e))
             except Exception as e:
@@ -1543,13 +2237,14 @@ class KopfnotenGUI:
     """Hauptklasse der optimierten GUI-Anwendung"""
     def __init__(self):
         self.root = tk.Tk()
+        # Pfade (Muss vor setup_application initialisiert sein!)
+        self.db_path = Path("output_database/kopfnoten_secure.db")
+        
         self.setup_application()
         # Manager
         self.path_manager = LinuxPathManager()
         self.status_manager = StatusManager(self)
         self.template_designer = SimpleTemplateDesigner(self.root)
-        # Pfade
-        self.db_path = Path("output_database/kopfnoten_secure.db")
         # GUI-Variablen
         self.template_var = tk.StringVar()
         self.output_var = tk.StringVar(value="output_word")
@@ -1588,6 +2283,11 @@ class KopfnotenGUI:
         self.stats_text = None
         self.selected_schueler_var = tk.StringVar(value="")
         self.student_search_after = None # For debouncing
+        
+        # New Filter Vars
+        self.teacher_filter_var = tk.StringVar()
+        self.status_filter_var = tk.StringVar(value="Alle")
+
         # Setup
         self.create_gui()
         self.load_initial_data()
@@ -1616,6 +2316,14 @@ class KopfnotenGUI:
         self.root.geometry("1200x900")
         self.root.minsize(1000, 700)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # AUTO-CLEANUP ON START: Bereinige Datenbank von alten (U...)-Leichen
+        try:
+            with KopfnotenImporter(self.db_path) as importer:
+                importer._clean_existing_subjects()
+        except Exception as e:
+            logging.error(f"Fehler beim Startup-Cleanup: {e}")
+
         # Style für bessere Optik
         style = ttk.Style()
         if "clam" in style.theme_names():
@@ -1969,6 +2677,16 @@ class KopfnotenGUI:
         ttk.Button(filter_controls, text="Suchen", command=self.search_students).pack(
             side=tk.LEFT, padx=(0, 5)
         )
+        
+        # NEW FILTERS
+        ttk.Label(filter_controls, text="Lehrer:").pack(side=tk.LEFT, padx=(10, 5))
+        ttk.Entry(filter_controls, textvariable=self.teacher_filter_var, width=10).pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Label(filter_controls, text="Status:").pack(side=tk.LEFT, padx=(10, 5))
+        self.status_filter_combo = ttk.Combobox(filter_controls, textvariable=self.status_filter_var, width=12, state="readonly", values=["Alle", "Vollständig", "Unvollständig"])
+        self.status_filter_combo.pack(side=tk.LEFT, padx=(0, 10))
+        self.status_filter_combo.bind("<<ComboboxSelected>>", lambda e: self.search_students())
+        
         ttk.Button(
             filter_controls, text="Filter zurücksetzen", command=self.reset_filters
         ).pack(side=tk.LEFT)
@@ -1994,7 +2712,8 @@ class KopfnotenGUI:
         tree_frame.grid_columnconfigure(0, weight=1)
         
         # Bindings
-        self.analysis_tree.bind("<Double-1>", lambda e: self.edit_selected_grade())
+        # Bindings
+        self.analysis_tree.bind("<Double-1>", self.on_tree_double_click)
 
         # Bearbeitung
         edit_frame = ttk.Frame(data_frame)
@@ -2370,9 +3089,86 @@ class KopfnotenGUI:
         student_name = values[1]
         student_class = values[2]
 
+        # Gather all student IDs in current order for navigation
+        all_items = self.analysis_tree.get_children()
+        student_context_list = []
+        for it in all_items:
+             v = self.analysis_tree.item(it)["values"]
+             if v:
+                 student_context_list.append({
+                     "id": v[0],
+                     "name": v[1],
+                     "klasse": v[2]
+                 })
+
         # Verwende vereinfachten Editor
         grade_editor = SimplifiedGradeEditor(self.root, str(self.db_path))
-        grade_editor.open_grade_editor(student_id, student_name, student_class)
+        # Pass parent (self) to allow refresh callback from Editor
+        grade_editor.app = self 
+        grade_editor.open_grade_editor(student_id, student_name, student_class, student_context_list)
+
+    def on_tree_double_click(self, event):
+        """Handler für Doppelklick auf Treeview"""
+        region = self.analysis_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+            
+        col = self.analysis_tree.identify_column(event.x)
+        # col ist string wie '#1', '#2'...
+        # ID=0, Name=1 (#1), Klasse=2 (#2), Fächer=3 (#3)...
+        # Spalten-Definition in refresh_analysis_data:
+        # columns = ["ID", "Name", "Klasse", "Fächer", "AV-Noten", "SV-Noten", "Status"]
+        # Treeview columns start indices: #1 -> Name (ID hidden is #0 text?), No wait.
+        # Treeview columns: identifier list. 
+        # identify_column returns '#n' where n is 1-based index of display columns?
+        # Let's check columns definition:
+        # self.analysis_tree["columns"] = ["ID", "Name", "Klasse", "Fächer", ...]
+        # #0 is tree column (hidden). #1 is ID. #2 is Name. #3 is Klasse. #4 is Fächer.
+        # Wait, let's verify column definition in refresh_analysis_data.
+        # columns = ["ID", "Name", "Klasse", "Fächer", ...]
+        # Treeview identifier '#1' corresponds to the first column in the values list?
+        # Actually usually:
+        # #0 = Label column (hidden).
+        # #1 = First data column (ID).
+        # #4 = Fächer.
+        
+        if col == "#4": # Spalte "Fächer"
+            selection = self.analysis_tree.selection()
+            if not selection: return
+            item_id = selection[0]
+            values = self.analysis_tree.item(item_id, "values")
+            if not values: return
+            
+            s_id = values[0]
+            s_name = values[1]
+            current_target_str = values[3]
+            
+            try:
+                current_target = int(current_target_str)
+            except:
+                current_target = 0
+                
+            new_target = simpledialog.askinteger(
+                "Soll-Fächer bearbeiten",
+                f"Soll-Wert für Fächeranzahl für {s_name}:",
+                initialvalue=current_target,
+                minvalue=1,
+                maxvalue=30,
+                parent=self.root
+            )
+            
+            if new_target is not None:
+                try:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute("UPDATE schueler SET target_subjects = ? WHERE schueler_id = ?", (new_target, s_id))
+                        conn.commit()
+                    self.refresh_analysis_data()
+                except Exception as e:
+                    messagebox.showerror("Fehler", f"Konnte Wert nicht speichern: {e}")
+            return
+            
+        # Default behavior for other columns: Edit Grades
+        self.edit_selected_grade()
 
     def refresh_template_list(self):
         """Aktualisiert Template-Liste"""
@@ -2560,7 +3356,6 @@ class KopfnotenGUI:
             # 2. Datenstruktur aufbauen
             from collections import defaultdict
             import pandas as pd
-            import re
             
             # Struktur: class -> student_id -> {name, klasse, subjects: {fach: {av, sv}}}
             class_data = defaultdict(lambda: defaultdict(lambda: {
@@ -2660,17 +3455,17 @@ class KopfnotenGUI:
                         
                         # Fallback: Wenn Liste leer, aber Status nicht ok (z.B. ganze Klasse schlecht)
                         if not missing:
-                            # Zielwert ermitteln (vereinfacht analog zu _calculate_status)
-                            target = 0
+                            # Zielwert ermitteln (Subjects * 2 für AV+SV)
                             jg = s["jg"]
-                            if jg in [5, 6]: target = 18
-                            elif jg == 7: target = 20
-                            elif jg == 8: target = 22
-                            elif jg == 9: target = 28
-                            elif jg == 10: target = 26
-                            else: target = max(s["cnt"], ref_subjects_calc) * 2 # Fallback
+                            target_grades = 0
+                            if jg in [5, 6]: target_grades = 18 # 9 * 2
+                            elif jg == 7: target_grades = 20    # 10 * 2
+                            elif jg == 8: target_grades = 22    # 11 * 2
+                            elif jg == 9: target_grades = 28    # 14 * 2
+                            elif jg == 10: target_grades = 26   # 13 * 2
+                            else: target_grades = max(s["cnt"], ref_subjects_calc) * 2 # Fallback
                             
-                            diff = target - s["notes_cnt"]
+                            diff = target_grades - s["notes_cnt"]
                             if diff > 0:
                                 for _ in range(diff):
                                     missing.append("Unbekanntes Fach ____")
@@ -2872,66 +3667,174 @@ class KopfnotenGUI:
                      self.analysis_tree.column(col, width=80)
 
             with sqlite3.connect(self.db_path) as conn:
-                # 1. Rohdaten abrufen
+                # 1. Rohdaten abrufen (Detailliert für Deduplizierung)
                 query = """
                     SELECT
-                        s.schueler_id,
-                        s.name,
-                        s.klasse,
-                        COUNT(n.noten_id) as faecher_count,
-                        SUM(CASE WHEN n.note_av IS NOT NULL THEN 1 ELSE 0 END) as av_count,
-                        SUM(CASE WHEN n.note_sv IS NOT NULL THEN 1 ELSE 0 END) as sv_count
+                        s.schueler_id, s.name, s.klasse,
+                        s.target_subjects,
+                        f.fach_kurz, f.fach_typ, f.fach_lang,
+                        n.note_av, n.note_sv,
+                        f.ist_wahlpflicht, n.ist_wahlpflicht_belegung,
+                        f.wahlpflicht_gruppe,
+                        n.lehrer_kuerzel
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
-                    WHERE 1=1
+                    LEFT JOIN faecher f ON n.fach_id = f.fach_id
+                    ORDER BY s.klasse, s.name
                 """
-                params = []
-                
-                # Filter anwenden (für Datenabruf brauchen wir trotzdem alle Klassen für Referenzwerte?
-                # Nein, Referenzwerte sind klassenspezifisch. Wenn wir filtern, sehen wir evtl. nur einen Schüler der Klasse.
-                # Problem: Wenn wir nur "Hans" aus "5a" laden, wissen wir nicht, was der Max-Wert der 5a ist.
-                # Lösung: Wir laden ALLE Daten für die Berechnung, filtern aber für die ANZEIGE.
-                # Das ist performanter für kleine DBs und sicherer für die Logik.
-                
-                cursor = conn.execute(query + " GROUP BY s.schueler_id, s.name, s.klasse ORDER BY s.klasse, s.name")
+                cursor = conn.execute(query)
                 rows = cursor.fetchall()
 
-                # 2. Daten nach Klasse gruppieren
+                # 2. Daten nach Schüler gruppieren und deduplizieren
                 from collections import defaultdict
-                class_students = defaultdict(list)
+                student_map = {} # schueler_id -> data
+                
+                # Mapper: Klasse -> Fach (Canonical) -> Lehrer (Set, da mehrere möglich?)
+                # Wir nehmen den letzten bekannten Lehrer oder sammeln alle.
+                # Besser: Klasse -> Fach -> Teacher Set
+                class_teacher_map = defaultdict(lambda: defaultdict(set))
+                
                 for row in rows:
-                    student_data = {
-                        "id": row[0],
-                        "name": row[1],
-                        "klasse": row[2],
-                        "faecher_count": row[3],
-                        "av_count": row[4] if row[4] is not None else 0,
-                        "sv_count": row[5] if row[5] is not None else 0
-                    }
-                    class_students[student_data["klasse"]].append(student_data)
+                    s_id, s_name, s_klasse, s_target, f_kurz, f_typ, f_lang, av, sv, f_wp, n_wp, wp_grp, lehrer_kuerzel = row # Adjusted unpacking
+                    
+                    if s_id not in student_map:
+                        student_map[s_id] = {
+                            "id": s_id, "name": s_name, "klasse": s_klasse,
+                            "target_subjects_db": s_target,
+                            "av_count": 0, "sv_count": 0,
+                            "dedup_subjects": set(),
+                            "teachers": set()
+                        }
+                    
+                    sm = student_map[s_id]
+                    if f_kurz or f_lang:
+                        # STANDARDIZED CANONICAL NAME
+                        fach_canonical = self._get_canonical_name(f_kurz, f_lang)
+                        
+                        # 2. Check Config (using CLEANED name)
+                        config_status = SUBJECT_STATUS_CONFIG.get(fach_canonical, "")
+                        is_wpu_config = "WPU" in config_status
+                        
+                        # DB Flags prüfen
+                        is_wpu = bool(f_wp) or bool(n_wp) or any(p in (wp_grp or "") for p in ["WPU", "WP"]) or is_wpu_config
+                        
+                        # OVERRIDE: Prioritize explicit config (User Request for Praxistag Fix)
+                        if config_status in ["Nebenfach", "Hauptfach"]:
+                             is_wpu = False
+                        
+                        # Store raw data for later processing (we need to count first across all rows)
+                        # Wir sammeln alle Fächer des Schülers erst in einer Liste
+                        if "raw_subjects" not in sm:
+                            sm["raw_subjects"] = []
+                        
+                        sm["raw_subjects"].append({
+                            "f_kurz": f_kurz,
+                            "f_typ": f_typ,
+                            "av": av,
+                            "sv": sv,
+                            "is_wpu": is_wpu,
+                            "f_canonical": fach_canonical
+                        })
+                        
+                        if lehrer_kuerzel:
+                             sm["teachers"].add(lehrer_kuerzel)
+                             class_teacher_map[s_klasse][fach_canonical].add(lehrer_kuerzel)
+
+
+                # 3. Post-Process per Student: Deduplizierung & WPU-Filterung
+                for s_id, sm in student_map.items():
+                    if "raw_subjects" not in sm: continue
+                    
+                    raw_list = sm["raw_subjects"]
+                    
+                    # Jahrgang ermitteln (aus Klasse)
+                    klasse = sm["klasse"]
+                    match = re.search(r'(\d+)', str(klasse))
+                    jahrgang = int(match.group(1)) if match else 0
+                    wpu_limit = 2 if jahrgang >= 9 else 1
+                    
+                    # A. Zähle WPU Noten und sammle benotete WPU Fächer
+                    graded_wpu_subjects = []
+                    for r in raw_list:
+                         if r["is_wpu"] and (r["av"] is not None or r["sv"] is not None):
+                             if r["f_canonical"] not in graded_wpu_subjects:
+                                 graded_wpu_subjects.append(r["f_canonical"])
+                    
+                    # Limit anwenden
+                    allowed_wpus = graded_wpu_subjects[:wpu_limit]
+                    
+                    for r in raw_list:
+                         f_kurz = r["f_kurz"]
+                         f_typ = r["f_typ"]
+                         av = r["av"]
+                         sv = r["sv"]
+                         is_wpu = r["is_wpu"]
+                         f_canonical = r["f_canonical"]
+                         
+                         is_rel_triad = (f_kurz == "Ethik") or (f_kurz == "Religion" and f_typ in ["evangelisch", "katholisch"])
+                         
+                         count_subject = True
+                         
+                         if is_wpu:
+                             # Exclude logic:
+                             if f_canonical not in allowed_wpus:
+                                 count_subject = False
+                             if av is None and sv is None:
+                                 count_subject = False
+                         
+                         # Name Cleaning für Display (User Request: "Praxistag WU" -> "Praxistag", "Chemie (U1)" -> "Chemie")
+                         # Wir entfernen "WU", "WP" am Ende oder als Wort.
+                         # Auch (U1), (U 2), (U1) entfernen
+                         clean_name = f_canonical
+                         clean_name = re.sub(r'\s+WU$', '', clean_name)
+                         clean_name = re.sub(r'\s+WP$', '', clean_name)
+                         clean_name = re.sub(r'\s*\(U\s*\d+\)', '', clean_name)
+                         clean_name = clean_name.strip()
+                         
+                         if count_subject:
+                             if is_rel_triad:
+                                 sm["dedup_subjects"].add("REL_TRIAD")
+                             elif is_wpu:
+                                 # Use cleaned canonical name + WPU prefix for safety unique keying
+                                 # This ensures distinct subjects are distinct, but merges identicals.
+                                 sm["dedup_subjects"].add(f"WPU_{clean_name}")
+                             else:
+                                 # Using cleaned canonical name instead of f_kurz/f_typ tuple 
+                                 # to avoid splitting same subject with diff abbreviations
+                                 # But we keep f_typ if needed (Rel/Eth)? 
+                                 # Rel/Eth is handled by REL_TRIAD.
+                                 # For others: "Deutsch" is "Deutsch".
+                                 sm["dedup_subjects"].add(clean_name)
+                         
+                         if av is not None: sm["av_count"] += 1
+                         if sv is not None: sm["sv_count"] += 1
+                
+                # In Klassen gruppieren für Referenzwert-Berechnung
+                class_students = defaultdict(list)
+                for sm in student_map.values():
+                    # Religion/Ethik Gruppe immer zusammenfassen
+                    # Falls REL_TRIAD existiert, ist es bereits ein Eintrag
+                    # Wir stellen sicher, dass alle Rel/Eth Einträge (auch falls fälschlich mehrfach vorhanden) als einer zählen.
+                    sm["faecher_count"] = len(sm["dedup_subjects"])
+                    class_students[sm["klasse"]].append(sm)
 
                 # 3. Status berechnen und in Treeview einfügen (nach Klasse sortiert)
                 for klasse in sorted(class_students.keys()):
                     students = class_students[klasse]
                     
-                    # Referenzwert für die Klasse ermitteln (5. höchster Fächerwert)
-                    # "Die Zahl muss von mindestens 5 Lernenden erreicht werden."
-                    subject_counts = sorted([s["faecher_count"] for s in students], reverse=True)
-                    if len(subject_counts) >= 5:
-                        ref_subjects = subject_counts[4] # 0-indexed, also das 5. Element
-                    elif subject_counts:
-                        ref_subjects = subject_counts[-1] # Fallback für kleine Klassen (min)
-                    else:
-                        ref_subjects = 0
-
-
-                    # Jahrgang aus Klasse extrahieren (z.B. "5a" -> 5, "10b" -> 10)
-                    import re
+                    # Schwellenwert: Maximalanzahl der Noten in dieser Klasse (AV + SV)
+                    max_notes_in_class = 0
+                    for s in students:
+                        notes_total = s["av_count"] + s["sv_count"]
+                        if notes_total > max_notes_in_class:
+                            max_notes_in_class = notes_total
+                    
+                    # Jahrgang aus Klasse extrahieren
                     match_year = re.match(r"(\d+)", klasse)
                     jahrgang = int(match_year.group(1)) if match_year else 0
 
                     for s in students:
-                        # FILTER LOGIK: Hier entscheiden, ob wir anzeigen
+                        # FILTER LOGIK
                         show_student = True
                         if class_filter and class_filter != "Alle":
                              if s["klasse"] != class_filter:
@@ -2945,7 +3848,97 @@ class KopfnotenGUI:
                             continue
 
                         current_notes = s["av_count"] + s["sv_count"]
-                        status = self._calculate_status(jahrgang, current_notes, s["faecher_count"], ref_subjects)
+                        
+                        # ZIELWERT ERMITTELN
+                        # Entweder DB-Wert oder Default für Jahrgang
+                        final_target = s["target_subjects_db"] if s["target_subjects_db"] else self.get_default_target_for_grade(jahrgang)
+                        
+                        status = self._calculate_status(jahrgang, current_notes, s["faecher_count"], final_target)
+
+                        # STATUS FILTER
+                        status_filter_val = self.status_filter_var.get()
+                        if status_filter_val != "Alle":
+                             if status != status_filter_val:
+                                 show_student = False
+
+                        # TEACHER FILTER
+                        teacher_filter_val = self.teacher_filter_var.get().strip().lower()
+                        if teacher_filter_val:
+                             # Logic Refinement:
+                             # If Status == Unvollständig (detected by status var) AND Teacher Filter Set:
+                             # Show ONLY if missing grades are from THIS teacher.
+                             
+                             if status == "Unvollständig":
+                                 # 1. Welche Fächer fehlen?
+                                 # Wir müssen wissen, welche 'regular subjects' der Jahrgang hat und was der Schüler hat.
+                                 # Das ist etwas teuer hier, wir machen es on demand.
+                                 
+                                 # Wir haben dedup_subjects (IST-Fächer).
+                                 # Wir rufen _get_class_regular_subjects ab (Per Class Logic)
+                                 # Class subjects
+                                 jg_subjects_meta = self._get_class_regular_subjects(s["klasse"]) # Dict[name, id]
+                                 jg_subject_names = set(jg_subjects_meta.keys())
+                                 
+
+                                 
+                                 
+                                 # SIMPLIFIED LOGIC (Compromise):
+                                 # Show if student is incomplete AND teacher has ANY relevance to this student (Active or Potential).
+                                 
+                                 is_relevant_teacher = False
+                                 
+                                 # 1. Active: Teacher has already given a grade
+                                 for t in s["teachers"]:
+                                     if teacher_filter_val in t.lower():
+                                         is_relevant_teacher = True
+                                         break
+                                         
+                                 # 2. Potential: Teacher teaches a subject this class takes
+                                 if not is_relevant_teacher:
+                                     # Check class map
+                                     class_map = class_teacher_map.get(s["klasse"], {})
+                                     for subj_name, teachers in class_map.items():
+                                         # Is this subject relevant for the student?
+                                         # Check against regular subjects or WPU
+                                         is_regular = subj_name in jg_subject_names
+                                         
+                                         # Simplified WPU check: simple existence in map is strong hint
+                                         # But strictly we should check if it's a "class subject". 
+                                         # jg_subject_names (now loaded via _get_class_regular_subjects) covers all NON-WPU subjects found in the class.
+                                         # For WPU, we might need to be broader or check class_wpus.
+                                         
+                                         if is_regular:
+                                              for t in teachers:
+                                                  if teacher_filter_val in t.lower():
+                                                      is_relevant_teacher = True
+                                                      break
+                                         if is_relevant_teacher: break
+                                         
+                                         # Check if WPU (if not regular)
+                                         if not is_regular:
+                                              # If teacher matches a WPU subject in this class, we assume potential relevance
+                                              # (Showing too many is better than too few here)
+                                              for t in teachers:
+                                                  if teacher_filter_val in t.lower():
+                                                       is_relevant_teacher = True
+                                                       break
+                                         if is_relevant_teacher: break
+
+                                 if not is_relevant_teacher:
+                                     show_student = False
+                             
+                             else:
+                                 # Standard Logic (Show if ANY grade from teacher)
+                                 has_match = False
+                                 for t in s["teachers"]:
+                                     if teacher_filter_val in t.lower():
+                                         has_match = True
+                                         break
+                                 if not has_match:
+                                     show_student = False
+                        
+                        if not show_student:
+                            continue
 
                         # Zeile einfügen
                         self.analysis_tree.insert(
@@ -2955,7 +3948,7 @@ class KopfnotenGUI:
                                 s["id"],
                                 s["name"],
                                 s["klasse"],
-                                s["faecher_count"],
+                                final_target, # Zeige SOLL anstatt IST (User Request)
                                 s["av_count"],
                                 s["sv_count"],
                                 status
@@ -2969,29 +3962,47 @@ class KopfnotenGUI:
             import traceback
             traceback.print_exc()
 
-    def _calculate_status(self, jahrgang: int, current_notes: int, faecher_count: int, ref_subjects: int) -> str:
-        """Berechnet den Status basierend auf Jahrgang und Notenanzahl (Neu: Binär)"""
-        
-        # Schwellenwerte für "Vollständig" (Notenanzahl = Fächer * 2)
-        threshold = 0
-        if jahrgang in [5, 6]:
-            threshold = 18 # 9 Fächer
-        elif jahrgang == 7:
-            threshold = 20 # 10 Fächer
-        elif jahrgang == 8:
-            threshold = 22 # 11 Fächer
-        elif jahrgang == 9:
-            threshold = 28 # 14 Fächer
-        elif jahrgang == 10:
-            threshold = 26 # 13 Fächer
+    def _calculate_status(self, jahrgang: int, current_notes: int, faecher_count: int, target_subjects: int = None) -> str:
+        """
+        Berechnet Status
+        target_subjects: Expliziter Sollwert (aus DB oder Default). Falls gesetzt, wird er genutzt.
+        """
+        # Default Logik (falls target_subjects nicht übergeben - sollte aber jetzt immer sein)
+        if target_subjects and target_subjects > 0:
+            target_subj = target_subjects
         else:
             # Fallback
-            threshold = max(faecher_count, ref_subjects) * 2
-
-        if current_notes >= threshold:
-            return "Vollständig"
+            target_subj = self.get_default_target_for_grade(jahrgang)
+        
+        is_complete = False
+        
+        if target_subj > 0:
+            # Wir prüfen, ob GENUG Noten da sind (Anzahl Noten >= Ziel * 2)
+            # ACHTUNG: Der User will Sollwert.
+            # Wenn Soll = 13, dann erwarte ich 26 Noten.
+            # Aber wir haben auch faecher_count (IST).
+            # Wenn IST < SOLL => Unvollständig? Ja.
+            # Wenn IST >= SOLL und Noten >= SOLL*2 => Vollständig
+            
+            # Simple Check: Habe ich genug Noten für das Ziel?
+            if current_notes >= (target_subj * 2):
+                 is_complete = True
         else:
-            return "Unvollständig"
+             # Fallback logic if Jahrgang is missing or other
+             if faecher_count > 0 and current_notes >= (faecher_count * 2):
+                 is_complete = True # Simple check
+        
+        return "Vollständig" if is_complete else "Unvollständig"
+
+    def get_default_target_for_grade(self, jahrgang: int) -> int:
+        """Liefert den Standard-Zielwert für die Fächeranzahl pro Jahrgang"""
+        if jahrgang in [5, 6]: return 9
+        elif jahrgang == 7: return 10
+        elif jahrgang == 8: return 11
+        elif jahrgang == 9: return 14
+        elif jahrgang == 10: return 13
+        return 0 if is_complete else "Unvollständig"
+
 
     def search_students(self, event=None):
         """Sucht Schüler mit Debounce"""
@@ -3010,6 +4021,8 @@ class KopfnotenGUI:
         """Setzt Filter zurück"""
         self.class_filter.set("Alle")
         self.student_search.delete(0, tk.END)
+        self.teacher_filter_var.set("")
+        self.status_filter_var.set("Alle")
         self.refresh_analysis_data()
 
     def delete_selected_student(self):
@@ -3158,6 +4171,167 @@ Entwickelt für IGS in Hessen
 
 © Jörg Pospischil 2025"""
         messagebox.showinfo("Über", about_text)
+        
+    def _get_canonical_name(self, f_kurz: str, f_lang: str) -> str:
+        """Standardisierte Logik für Fach-Namen"""
+        # 1. Canonical name lookup (Prefer Kurz mapping, fallback to Lang)
+        # Check if f_kurz is in mapping
+        if f_kurz in FAECHER_MAPPING:
+            base_name = FAECHER_MAPPING[f_kurz]
+        else:
+            base_name = f_lang if f_lang else f_kurz
+            
+        # CLEANING: Suffixes entfernen
+        clean_name = base_name
+        if clean_name:
+            clean_name = re.sub(r'\s+WU$', '', clean_name)
+            clean_name = re.sub(r'\s+WP$', '', clean_name)
+            clean_name = re.sub(r'\s*\(U\s*\d+\)', '', clean_name)
+            clean_name = clean_name.strip()
+            
+        return clean_name
+
+    def _get_class_wpu_subjects(self, student_class: str) -> List[Dict]:
+        """Holt ALLE WPU-Fächer, die in dieser Klasse existieren"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Finde alle Fächer, die eine 'ist_wahlpflicht' Flag oder WPU Gruppe haben
+                # UND die von Schülern dieser Klasse belegt sind
+                cursor = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        f.fach_id,
+                        f.fach_lang,
+                        f.fach_kurz,
+                        f.ist_wahlpflicht,
+                        f.wahlpflicht_gruppe,
+                         -- Wir holen ein beispielhaftes Lehrerkürzel (wenn vorhanden) für dieses Fach in dieser Klasse
+                        (SELECT lehrer_kuerzel FROM noten n2 
+                         JOIN schueler s2 ON n2.schueler_id = s2.schueler_id 
+                         WHERE n2.fach_id = f.fach_id AND s2.klasse = ? 
+                         ORDER BY n2.lehrer_kuerzel DESC LIMIT 1) as lehrer_kuerzel
+                    FROM faecher f
+                    JOIN noten n ON f.fach_id = n.fach_id
+                    JOIN schueler s ON n.schueler_id = s.schueler_id
+                    WHERE s.klasse = ?
+                    AND (f.ist_wahlpflicht = 1 OR f.wahlpflicht_gruppe LIKE '%WPU%' OR f.wahlpflicht_gruppe LIKE '%WP%')
+                    """,
+                    (student_class, student_class),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Fehler beim Laden der Klassen-WPU-Fächer: {e}")
+            return []
+
+    def _get_class_regular_subjects(self, student_class: str) -> Dict[str, int]:
+        """Ermittelt alle regulären Fächer (kein WPU) für eine spezifische Klasse.
+           Returns: Dict[Fachname (Canonical), FachID]"""
+        regular_subjects = {}
+        if not student_class:
+            return {}
+            
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # Query: Finde alle Fächer, die in DIESER Klasse vorkommen
+                query = """
+                    SELECT DISTINCT f.fach_id, f.fach_lang, f.fach_kurz, f.ist_wahlpflicht, f.wahlpflicht_gruppe
+                    FROM faecher f
+                    JOIN noten n ON f.fach_id = n.fach_id
+                    JOIN schueler s ON n.schueler_id = s.schueler_id
+                    WHERE s.klasse = ?
+                """
+                cursor = conn.execute(query, (student_class,))
+                rows = cursor.fetchall()
+                
+                for row in rows:
+                    fach_lang = row["fach_lang"]
+                    fach_kurz = row["fach_kurz"]
+                    fach_id = row["fach_id"]
+                    
+                    fach_canonical = self._get_canonical_name(fach_kurz, fach_lang)
+                    
+                    # Check Config first
+                    config_status = SUBJECT_STATUS_CONFIG.get(fach_canonical, "")
+                    is_wpu_config = "WPU" in config_status
+                    
+                    # Check DB flags
+                    is_wpu_db = bool(row["ist_wahlpflicht"]) or (row["wahlpflicht_gruppe"] and ("WPU" in row["wahlpflicht_gruppe"] or "WP" in row["wahlpflicht_gruppe"]))
+                    
+                    # Entscheidung: Ist es regulär?
+                    is_regular = False
+                    if config_status in ["Hauptfach", "Nebenfach"]:
+                        is_regular = True # Override: Config sagt regulär (z.B. Praxistag)
+                    elif is_wpu_config:
+                        is_regular = False # Override: Config sagt WPU
+                    else:
+                        is_regular = not is_wpu_db # Fallback auf DB
+                    
+                    if is_regular:
+                        regular_subjects[fach_canonical] = fach_id # Store ID keyed by CANONICAL NAME
+                        
+        except Exception as e:
+            logging.error(f"Fehler beim Laden der Klassenfächer: {e}")
+            
+        return regular_subjects
+
+    def _get_year_regular_subjects(self, jahrgang: int) -> Dict[str, int]:
+        """Ermittelt alle regulären Fächer (kein WPU) für einen kompletten Jahrgang.
+           Returns: Dict[Fachname, FachID]"""
+        regular_subjects = {}
+        if not jahrgang:
+            return {}
+            
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                # Patterns für Jahrgangssuche (z.B. 9% für 9a, 09% für 09a)
+                patterns = [f"{jahrgang}%", f"{jahrgang:02d}%"]
+                
+                # Query: Finde alle Fächer, die in diesem Jahrgang vorkommen
+                # Wir holen fach_id dazu
+                query = """
+                    SELECT DISTINCT f.fach_id, f.fach_kurz, f.fach_lang, f.ist_wahlpflicht, f.wahlpflicht_gruppe
+                    FROM faecher f
+                    JOIN noten n ON f.fach_id = n.fach_id
+                    JOIN schueler s ON n.schueler_id = s.schueler_id
+                    WHERE (""" + " OR ".join(["s.klasse LIKE ?"] * len(patterns)) + """)
+                """
+                cursor = conn.execute(query, patterns)
+                rows = cursor.fetchall()
+                
+                for row in rows:
+                    fach_lang = row["fach_lang"]
+                    fach_kurz = row["fach_kurz"]
+                    fach_id = row["fach_id"]
+                    
+                    fach_canonical = self._get_canonical_name(fach_kurz, fach_lang)
+                    
+                    # Check Config first
+                    config_status = SUBJECT_STATUS_CONFIG.get(fach_canonical, "")
+                    is_wpu_config = "WPU" in config_status
+                    
+                    # Check DB flags
+                    is_wpu_db = bool(row["ist_wahlpflicht"]) or (row["wahlpflicht_gruppe"] and ("WPU" in row["wahlpflicht_gruppe"] or "WP" in row["wahlpflicht_gruppe"]))
+                    
+                    # Entscheidung: Ist es regulär?
+                    is_regular = False
+                    if config_status in ["Hauptfach", "Nebenfach"]:
+                        is_regular = True # Override: Config sagt regulär (z.B. Praxistag)
+                    elif is_wpu_config:
+                        is_regular = False # Override: Config sagt WPU
+                    else:
+                        is_regular = not is_wpu_db # Fallback auf DB
+                    
+                    if is_regular:
+                        regular_subjects[fach_canonical] = fach_id # Store ID keyed by CANONICAL NAME
+                        
+        except Exception as e:
+            logging.error(f"Fehler beim Laden der Jahrgangsfächer: {e}")
+            
+        return regular_subjects
 
     def show_linux_help(self):
         """Zeigt Linux-Hilfe"""
