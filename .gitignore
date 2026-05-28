@@ -34,3 +34,11 @@ keyring_pass.cfg
 build/
 dist/
 *.spec
+
+# Cursor sync safety
+.env
+.env.*
+*.env
+sec.env
+*.secrets.env
+.envrc
