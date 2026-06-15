@@ -45,6 +45,32 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Windows: EXE Build und Installer
+
+```powershell
+# im Projektordner
+.\build_windows.ps1
+```
+
+Danach liegt die EXE unter `dist/KopfnotenTool.exe`.
+
+Für einen Installer:
+
+1. [Inno Setup](https://jrsoftware.org/isdl.php) installieren
+2. `installer/KopfnotenTool.iss` öffnen
+3. Build starten (`Compile`)
+
+Der Installer fragt beim Setup gezielt nach:
+
+- Datenpfad (Basisordner)
+- Standard-Importpfad
+- Word-Exportpfad
+- Excel-Exportpfad
+- Datenbank-Ordner
+- Backup-Ordner für Datenbanksicherungen
+
+Diese Werte werden in `kopfnotentool.paths.json` neben der EXE gespeichert.
+
 ## Nutzung
 
 ```bash
@@ -68,10 +94,10 @@ Durch Doppelklick auf einen Schüler (Spalte "Fächer") öffnet sich ein Editor,
 
 ## Konfiguration
 
-- Die Datenbank wird im Verzeichnis `output_database/` verschlüsselt angelegt.
-- Export‑Dateien landen im Verzeichnis `output_excel/` (Listen) und  `output_word/` (Serienbriefe).
-- Templates werden im Ordner `templates/` gespeichert.
-- SPH‑Konfiguration (`sph_config.json`) enthält zuletzt genutzte Schule und Anmeldedaten (verschlüsselt).
+- Laufzeitpfade werden über `kopfnotentool.paths.json` gesteuert.
+- Eine Beispielkonfiguration liegt in `kopfnotentool.paths.example.json`.
+- Wichtige Pfade: Import, Word-/Excel-Export, Datenbankpfad, Backup-Ordner, Template-/Log-/Temp-Verzeichnisse.
+- Im Menü `Datei` gibt es den Punkt **Datenbank sichern** (Backup in den konfigurierten Backup-Ordner).
 
 ## Lizenz
 

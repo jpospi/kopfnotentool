@@ -12,6 +12,7 @@ import json
 import shutil
 import tempfile
 import re
+import io
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -20,23 +21,26 @@ from docxtpl import DocxTemplate
 from docx import Document
 from docx.shared import Inches
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from app_paths import load_app_paths
+
+APP_PATHS = load_app_paths()
 
 # Ensure temp directory exists with proper permissions
-temp_dir = Path("temp")
-temp_dir.mkdir(exist_ok=True)
-if os.path.exists(temp_dir):
+temp_dir = APP_PATHS.temp_dir
+temp_dir.mkdir(exist_ok=True, parents=True)
+if os.name != "nt" and os.path.exists(temp_dir):
     os.chmod(temp_dir, 0o755) # Set proper permissions
 
 # Ensure logs directory exists
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
+log_dir = APP_PATHS.logs_dir
+log_dir.mkdir(exist_ok=True, parents=True)
 
 # Logging-Konfiguration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("logs/kopfnoten_gui.log", encoding="utf-8"),
+        logging.FileHandler(str(APP_PATHS.logs_dir / "kopfnoten_gui.log"), encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -420,7 +424,7 @@ SV-Note: {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% 
                 title="Template speichern",
                 defaultextension=".docx",
                 filetypes=[("Word-Dokument", "*.docx")],
-                initialdir="templates",
+                initialdir=str(APP_PATHS.templates_dir),
             )
             if not filename:
                 return
@@ -714,6 +718,13 @@ class KopfnotenImporter:
             for idx, col_name in fach_info:
                 # Column names only contain subject, teacher is in the cell value
                 fach_clean = str(col_name).strip()
+
+                # SPH-Exportartefakt ignorieren:
+                # In Jg. 9 enthalten manche Dateien eine Sammelspalte wie
+                # "Al~Bio~Che~...~WPU", die KEIN echtes Fach ist.
+                if fach_clean.count("~") >= 3:
+                    self.logger.info(f"Ignoriere Sammelspalte ohne Fachbezug: {fach_clean}")
+                    continue
                 
                 # BEREINIGUNG: Entferne Zusätze wie (U1), (U2), (U 1) etc.
                 # Regex: Sucht nach (U, gefolgt von Leerzeichen/Zahlen, Klammer zu) am Ende oder mittendrin
@@ -982,6 +993,14 @@ class KopfnotenImporter:
                 s_lang = subj[2]
                 s_typ = subj[3]
                 s_wp_gruppe = subj[4]
+
+                # Entferne bekannte Sammel-/Artefaktfächer aus SPH-Dateien (z. B. "Al~Bio~...~WPU")
+                if (s_kurz and s_kurz.count("~") >= 3) or (s_lang and s_lang.count("~") >= 3):
+                    self.logger.info(f"Entferne Artefakt-Fach: ID {s_id} '{s_lang}'")
+                    self.conn.execute("DELETE FROM noten WHERE fach_id = ?", (s_id,))
+                    self.conn.execute("DELETE FROM faecher WHERE fach_id = ?", (s_id,))
+                    changes_count += 1
+                    continue
 
                 # Check Regex
                 clean_lang = re.sub(r'\s*\(\s*U\s*\d+\s*\)', '', s_lang, flags=re.IGNORECASE).strip()
@@ -2237,8 +2256,9 @@ class KopfnotenGUI:
     """Hauptklasse der optimierten GUI-Anwendung"""
     def __init__(self):
         self.root = tk.Tk()
+        self.paths = APP_PATHS
         # Pfade (Muss vor setup_application initialisiert sein!)
-        self.db_path = Path("output_database/kopfnoten_secure.db")
+        self.db_path = self.paths.database_path
         
         self.setup_application()
         # Manager
@@ -2247,7 +2267,7 @@ class KopfnotenGUI:
         self.template_designer = SimpleTemplateDesigner(self.root)
         # GUI-Variablen
         self.template_var = tk.StringVar()
-        self.output_var = tk.StringVar(value="output_word")
+        self.output_var = tk.StringVar(value=str(self.paths.output_word_dir))
         self.export_running = False
         self.ui_queue = queue.Queue()
 
@@ -2255,7 +2275,7 @@ class KopfnotenGUI:
         from credentials import CredentialManager
         from login_gui import LoginWindow
         
-        self.credentials_manager = CredentialManager()
+        self.credentials_manager = CredentialManager(data_dir=str(self.paths.temp_dir))
         
         # Hide main window during login
         self.root.withdraw()
@@ -2283,6 +2303,7 @@ class KopfnotenGUI:
         self.stats_text = None
         self.selected_schueler_var = tk.StringVar(value="")
         self.student_search_after = None # For debouncing
+        self.sph_missing_overview = {}
         
         # New Filter Vars
         self.teacher_filter_var = tk.StringVar()
@@ -2332,12 +2353,13 @@ class KopfnotenGUI:
     def setup_linux_environment(self):
         """Linux-spezifische Umgebungseinrichtung"""
         directories = [
-            Path("logs"),
-            Path("templates"),
-            Path("output_word"),
-            Path("output_excel"),
-            Path("output_database"),
-            Path("temp"),
+            self.paths.logs_dir,
+            self.paths.templates_dir,
+            self.paths.output_word_dir,
+            self.paths.output_excel_dir,
+            self.paths.database_path.parent,
+            self.paths.temp_dir,
+            self.paths.backup_dir,
         ]
         for directory in directories:
             try:
@@ -2383,7 +2405,7 @@ class KopfnotenGUI:
         """Lädt SPH Konfiguration (nur Klassen)"""
         try:
             import json
-            config_path = Path("sph_config.json")
+            config_path = self.paths.sph_config_path
             if config_path.exists():
                 with open(config_path, "r") as f:
                     config = json.load(f)
@@ -2403,7 +2425,7 @@ class KopfnotenGUI:
         """Speichert SPH Konfiguration (nur Klassen)"""
         try:
             import json
-            config_path = Path("sph_config.json")
+            config_path = self.paths.sph_config_path
             
             # Read existing to preserve school/user if they were there (for prefill consistency with LoginWindow)
             config = {}
@@ -2452,6 +2474,7 @@ class KopfnotenGUI:
 
     def run_sph_import(self):
         """Führt den SPH-Import Prozess aus"""
+        self.sph_missing_overview = {}
         # Credentials from Manager
         if not self.credentials_manager.credentials:
              messagebox.showerror("Fehler", "Nicht eingeloggt. Bitte melden Sie sich zuerst an.")
@@ -2484,7 +2507,7 @@ class KopfnotenGUI:
         import threading
         t = threading.Thread(target=self._sph_worker, args=(school, user, pw, tasks))
         t.start()
-    
+
     def _sph_worker(self, school, user, pw, tasks):
         """Hintergrund-Worker für SPH Download"""
         try:
@@ -2497,7 +2520,7 @@ class KopfnotenGUI:
             
             # Download Loop
             downloaded_files = []
-            output_dir = Path("temp")
+            output_dir = self.paths.temp_dir
             output_dir.mkdir(parents=True, exist_ok=True)
             
             letters = "abcdefghijklmnopqrstuvwxyz"
@@ -2516,7 +2539,7 @@ class KopfnotenGUI:
             # Import Trigger
             if downloaded_files:
                 self.queue_ui(self.status_manager.set_status, f"Importiere {len(downloaded_files)} Dateien...")
-                self.queue_ui(self._process_downloaded_files, downloaded_files)
+                self.queue_ui(self._process_downloaded_files, downloaded_files, (school, user, pw))
             else:
                 self.queue_ui(messagebox.showwarning, "Ergebnis", "Keine Dateien erfolgreich geladen.")
 
@@ -2524,7 +2547,7 @@ class KopfnotenGUI:
             self.queue_ui(messagebox.showerror, "SPH Fehler", f"{e}")
             self.queue_ui(self.status_manager.set_status, "Fehler bei SPH Import")
 
-    def _process_downloaded_files(self, file_paths):
+    def _process_downloaded_files(self, file_paths, sph_credentials=None):
         """Verarbeitet heruntergeladene Dateien"""
         try:
             self.path_manager.ensure_directory(self.db_path.parent)
@@ -2533,14 +2556,65 @@ class KopfnotenGUI:
             # Assuming KopfnotenImporter is available (it is in the same file)
             with KopfnotenImporter(str(self.db_path)) as importer:
                 count = 0
+                failed = []
                 for fp in file_paths:
-                    importer.import_excel_file(str(fp))
-                    count += 1
+                    try:
+                        importer.import_excel_file(str(fp))
+                        count += 1
+                    except Exception as e:
+                        failed.append((Path(fp).name, str(e)))
+                        logging.getLogger("importer").error(
+                            f"Fehler beim Import von {Path(fp).name}: {e}"
+                        )
+                # Nach Import einmal Artefakt-/Namensbereinigung ausführen
+                importer._clean_existing_subjects()
                 
             self.refresh_all_data()
-            messagebox.showinfo("SPH Import", f"{count} Klassen erfolgreich importiert.")
+            # SPH-Abgleich NACH abgeschlossenem Import laden
+            if sph_credentials:
+                school, user, pw = sph_credentials
+                self.status_manager.set_status("SPH-Abgleich wird nach Import aktualisiert...")
+                import threading
+                threading.Thread(
+                    target=self._sph_post_import_sync_worker,
+                    args=(school, user, pw),
+                    daemon=True
+                ).start()
+
+            if failed:
+                details = "\n".join([f"- {name}: {err}" for name, err in failed[:10]])
+                more = ""
+                if len(failed) > 10:
+                    more = f"\n... und {len(failed) - 10} weitere Fehler."
+                messagebox.showwarning(
+                    "SPH Import teilweise erfolgreich",
+                    f"{count} Klassen erfolgreich importiert.\n"
+                    f"{len(failed)} Klassen konnten nicht importiert werden.\n\n"
+                    f"{details}{more}"
+                )
+            else:
+                messagebox.showinfo("SPH Import", f"{count} Klassen erfolgreich importiert.")
         except Exception as e:
             messagebox.showerror("Import Fehler", f"{e}")
+
+    def _sph_post_import_sync_worker(self, school, user, pw):
+        """Lädt SPH-Abgleich im Anschluss an einen erfolgreichen Import."""
+        try:
+            from sph_downloader import SPHDownloader
+            downloader = SPHDownloader(logger=logging.getLogger("sph"))
+            downloader.login(school, user, pw)
+            overview = downloader.fetch_missing_submissions_overview()
+            self.sph_missing_overview = overview
+            self.queue_ui(self.refresh_analysis_data)
+            self.queue_ui(
+                self.status_manager.set_status,
+                f"SPH-Abgleich aktualisiert ({len(overview)} Klassen)."
+            )
+        except Exception as e:
+            self.queue_ui(
+                self.status_manager.set_status,
+                f"SPH-Abgleich nach Import fehlgeschlagen: {e}"
+            )
 
     def create_menu(self):
         """Erstellt vereinfachtes Menü"""
@@ -2551,6 +2625,7 @@ class KopfnotenGUI:
         menubar.add_cascade(label="Datei", menu=file_menu)
         file_menu.add_command(label="Datenbank öffnen", command=self.open_database)
         file_menu.add_command(label="Datenbank-Info", command=self.show_database_info)
+        file_menu.add_command(label="Datenbank sichern", command=self.backup_database)
         file_menu.add_separator()
         file_menu.add_command(label="Beenden", command=self.root.quit)
         # Werkzeuge-Menü
@@ -2690,6 +2765,11 @@ class KopfnotenGUI:
         ttk.Button(
             filter_controls, text="Filter zurücksetzen", command=self.reset_filters
         ).pack(side=tk.LEFT)
+        ttk.Label(
+            filter_controls,
+            text="  SPH-Abgleich je Lernendem: rot/gelb/grün",
+            foreground="#555"
+        ).pack(side=tk.LEFT, padx=(10, 0))
         # Daten
         data_frame = ttk.LabelFrame(analysis_frame, text="Schüler und Noten")
         data_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -2705,6 +2785,10 @@ class KopfnotenGUI:
         self.analysis_tree.config(
             yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set
         )
+        # Lernendenbezogene SPH-Ampelfarben
+        self.analysis_tree.tag_configure("student_red", background="#f8d7da")
+        self.analysis_tree.tag_configure("student_yellow", background="#fff3cd")
+        self.analysis_tree.tag_configure("student_green", background="#d1e7dd")
         self.analysis_tree.grid(row=0, column=0, sticky="nsew")
         v_scrollbar.grid(row=0, column=1, sticky="ns")
         h_scrollbar.grid(row=1, column=0, sticky="ew")
@@ -2888,7 +2972,7 @@ class KopfnotenGUI:
         # Ausgabeverzeichnis prüfen
         output_dir = Path(self.output_var.get().strip())
         if not output_dir:
-            output_dir = Path("output_word")
+            output_dir = self.paths.output_word_dir
             self.output_var.set(str(output_dir))
         try:
             self.path_manager.ensure_directory(output_dir)
@@ -2988,7 +3072,7 @@ class KopfnotenGUI:
 
         output_dir = Path(self.output_var.get().strip())
         if not output_dir:
-            output_dir = Path("output_word")
+            output_dir = self.paths.output_word_dir
             self.output_var.set(str(output_dir))
         try:
             self.path_manager.ensure_directory(output_dir)
@@ -3173,7 +3257,7 @@ class KopfnotenGUI:
     def refresh_template_list(self):
         """Aktualisiert Template-Liste"""
         self.template_list.delete(0, tk.END)
-        template_dir = Path("templates")
+        template_dir = self.paths.templates_dir
         if template_dir.exists():
             for template_file in template_dir.glob("*.docx"):
                 self.template_list.insert(tk.END, template_file.name)
@@ -3187,7 +3271,7 @@ class KopfnotenGUI:
             )
             return
         template_name = self.template_list.get(selection[0])
-        template_path = Path("templates") / template_name
+        template_path = self.paths.templates_dir / template_name
         if template_path.exists():
             # Make sure we're using an absolute path
             absolute_path = template_path.resolve()
@@ -3212,7 +3296,7 @@ class KopfnotenGUI:
         filename = filedialog.askopenfilename(
             title="Template-Datei auswählen",
             filetypes=[("Word-Dokumente", "*.docx"), ("Alle Dateien", "*.*")],
-            initialdir=str(Path("templates").resolve()),
+            initialdir=str(self.paths.templates_dir.resolve()),
         )
         if filename:
             # Make sure we're using an absolute path
@@ -3224,7 +3308,7 @@ class KopfnotenGUI:
         """Ausgabeverzeichnis auswählen"""
         dirname = filedialog.askdirectory(
             title="Ausgabeverzeichnis auswählen",
-            initialdir=str(Path("output_word").resolve()),
+            initialdir=str(self.paths.output_word_dir.resolve()),
         )
         if dirname:
             self.output_var.set(dirname)
@@ -3235,6 +3319,7 @@ class KopfnotenGUI:
         filenames = filedialog.askopenfilenames(
             title="Excel-Dateien auswählen",
             filetypes=[("Excel-Dateien", "*.xlsx *.xls"), ("Alle Dateien", "*.*")],
+            initialdir=str(self.paths.import_dir.resolve()),
         )
         if filenames:
             for filename in filenames:
@@ -3331,206 +3416,168 @@ class KopfnotenGUI:
         """Exportiert detaillierte Liste der Schüler mit Status Unvollständig nach Excel"""
         try:
             # Output Directory sicherstellen
-            output_dir = Path("output_excel") # Changed to output_excel
+            output_dir = self.paths.output_excel_dir
             self.path_manager.ensure_directory(output_dir)
-            
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = output_dir / f"Kontrollliste_Luecken_{timestamp}.xlsx"
-            
-            # 1. Daten abrufen (Detailliert)
+
+            import pandas as pd
+            from collections import defaultdict
+            from copy import copy
+
             with sqlite3.connect(self.db_path) as conn:
-                # Hole alle Noten-Details
-                cursor = conn.execute(
+                summary_rows = conn.execute(
                     """
                     SELECT
-                        s.schueler_id, s.name, s.klasse,
-                        f.fach_kurz, n.note_av, n.note_sv, n.lehrer_kuerzel
+                        s.schueler_id,
+                        s.name,
+                        s.klasse,
+                        s.target_subjects,
+                        COUNT(CASE WHEN n.note_av IS NOT NULL THEN 1 END) AS av_count,
+                        COUNT(CASE WHEN n.note_sv IS NOT NULL THEN 1 END) AS sv_count,
+                        COUNT(DISTINCT n.fach_id) AS faecher_count
+                    FROM schueler s
+                    LEFT JOIN noten n ON s.schueler_id = n.schueler_id
+                    GROUP BY s.schueler_id, s.name, s.klasse, s.target_subjects
+                    ORDER BY s.klasse, s.name
+                    """
+                ).fetchall()
+
+                detail_rows = conn.execute(
+                    """
+                    SELECT
+                        s.schueler_id,
+                        s.klasse,
+                        COALESCE(f.fach_lang, f.fach_kurz, '') AS fach_name,
+                        n.lehrer_kuerzel,
+                        n.note_av,
+                        n.note_sv
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
                     LEFT JOIN faecher f ON n.fach_id = f.fach_id
-                    ORDER BY s.klasse, s.name
+                    ORDER BY s.klasse, s.schueler_id
                     """
-                )
-                rows = cursor.fetchall()
+                ).fetchall()
 
-            # 2. Datenstruktur aufbauen
-            from collections import defaultdict
-            import pandas as pd
-            
-            # Struktur: class -> student_id -> {name, klasse, subjects: {fach: {av, sv}}}
-            class_data = defaultdict(lambda: defaultdict(lambda: {
-                "name": "", 
-                "klasse": "", 
-                "notes": defaultdict(set) # fach -> set("AV", "SV")
-            }))
-            # Struktur: class -> fach -> lehrer
-            class_teachers = defaultdict(dict)
-            
-            for row in rows:
-                s_id, name, klasse, fach, av, sv, lehrer = row
-                st = class_data[klasse][s_id]
-                st["name"] = name
-                st["klasse"] = klasse
-                if fach:
-                    if lehrer:
-                        class_teachers[klasse][fach] = lehrer
-                    if av is not None: st["notes"][fach].add("AV")
-                    if sv is not None: st["notes"][fach].add("SV")
+            subjects_local_map = defaultdict(dict)
+            class_subject_teachers = defaultdict(lambda: defaultdict(set))
+            for s_id, klasse, fach_name, lehrer, av, sv in detail_rows:
+                fach = (fach_name or "").strip()
+                if not fach:
+                    continue
+                if lehrer:
+                    class_subject_teachers[str(klasse)][fach].add(str(lehrer).strip())
+                if fach not in subjects_local_map[s_id]:
+                    subjects_local_map[s_id][fach] = {"av": False, "sv": False}
+                if av is not None:
+                    subjects_local_map[s_id][fach]["av"] = True
+                if sv is not None:
+                    subjects_local_map[s_id][fach]["sv"] = True
 
-            # 3. Analyse & Vergleich pro Klasse
             export_rows = []
-            
-            # DataFrame-Listen für separate Sheets
             sheets_data = defaultdict(list)
-            
-            for klasse in sorted(class_data.keys()):
-                students = class_data[klasse]
-                
-                # A. Reference-Set aufbauen
-                # Zuerst Status für alle berechnen
-                student_stats = []
-                for s_id, s_data in students.items():
-                    # Metriken berechnen
-                    faecher_count = len(s_data["notes"])
-                    current_notes = sum(len(types) for types in s_data["notes"].values())
-                    
-                    # Jahrgang
-                    match_year = re.match(r"(\d+)", klasse)
-                    jahrgang = int(match_year.group(1)) if match_year else 0
-                    
-                    # Ref_subjects dummy (wird gleich korrigiert)
-                    status = "Temp" 
-                    student_stats.append({
-                        "id": s_id,
-                        "data": s_data,
-                        "cnt": faecher_count,
-                        "notes_cnt": current_notes,
-                        "jg": jahrgang
-                    })
-                
-                # Klasse-Referenz (Max Fächer)
-                if not student_stats: continue
-                
-                max_subjects = max(s["cnt"] for s in student_stats)
-                # Ref subjects für Status-Berechnung (5. höchster oder max)
-                sorted_counts = sorted([s["cnt"] for s in student_stats], reverse=True)
-                if len(sorted_counts) >= 5:
-                    ref_subjects_calc = sorted_counts[4]
-                else:
-                    ref_subjects_calc = sorted_counts[-1] if sorted_counts else 0
 
-                # Status final berechnen & Reference Students finden
-                ref_students_notes = set() # Set of (Fach, Typ)
-                
-                for s in student_stats:
-                    s["status"] = self._calculate_status(s["jg"], s["notes_cnt"], s["cnt"], ref_subjects_calc)
-                    
-                    # Ist Reference Student? (Vollständig UND Max Fächer)
-                    if s["status"] == "Vollständig" and s["cnt"] == max_subjects:
-                        # Add their notes to reference set
-                        for fach, types in s["data"]["notes"].items():
-                            for t in types:
-                                ref_students_notes.add((fach, t))
-                
-                # Fallback: Wenn kein Reference Student gefunden (z.B. ganze Klasse schlecht), 
-                # nimm den Besten
-                if not ref_students_notes and student_stats:
-                     best_student = max(student_stats, key=lambda x: x["notes_cnt"])
-                     for fach, types in best_student["data"]["notes"].items():
-                            for t in types:
-                                ref_students_notes.add((fach, t))
+            for s_id, name, klasse, target_db, av_count, sv_count, faecher_count in summary_rows:
+                match_year = re.match(r"(\d+)", str(klasse))
+                jahrgang = int(match_year.group(1)) if match_year else 0
+                target = target_db if target_db else self.get_default_target_for_grade(jahrgang)
+                current_notes = (av_count or 0) + (sv_count or 0)
+                local_status = self._calculate_status(jahrgang, current_notes, faecher_count or 0, target)
 
-                # B. Fehlende Noten ermitteln für "Unvollständig"
-                for s in student_stats:
-                    if s["status"] == "Unvollständig":
-                        missing = []
-                        # Vergleich mit Reference Set
-                        for ref_fach, ref_typ in sorted(ref_students_notes):
-                            # Hat der Schüler diese Note?
-                            if not (ref_fach in s["data"]["notes"] and ref_typ in s["data"]["notes"][ref_fach]):
-                                # Get teacher from the class-wide map
-                                lehrer = class_teachers[klasse].get(ref_fach, "")
-                                lehrer_str = f" [{lehrer}]" if lehrer else ""
-                                missing.append(f"{ref_fach} ({ref_typ}){lehrer_str} ____")
-                        
-                        # Fallback: Wenn Liste leer, aber Status nicht ok (z.B. ganze Klasse schlecht)
-                        if not missing:
-                            # Zielwert ermitteln (Subjects * 2 für AV+SV)
-                            jg = s["jg"]
-                            target_grades = 0
-                            if jg in [5, 6]: target_grades = 18 # 9 * 2
-                            elif jg == 7: target_grades = 20    # 10 * 2
-                            elif jg == 8: target_grades = 22    # 11 * 2
-                            elif jg == 9: target_grades = 28    # 14 * 2
-                            elif jg == 10: target_grades = 26   # 13 * 2
-                            else: target_grades = max(s["cnt"], ref_subjects_calc) * 2 # Fallback
-                            
-                            diff = target_grades - s["notes_cnt"]
-                            if diff > 0:
-                                for _ in range(diff):
-                                    missing.append("Unbekanntes Fach ____")
-                            else:
-                                missing.append("Keine spezifische Abweichung (Referenz fehlt) ____")
+                sph_text, _tag, sph_status_override = self._get_sph_alignment_for_student(
+                    klasse, subjects_local_map.get(s_id, {}), local_status
+                )
+                final_status = sph_status_override if sph_status_override else local_status
 
-                        missing_str = ", ".join(missing)
-                        
-                        row = {
-                            "Klasse": s["data"]["klasse"],
-                            "Name": s["data"]["name"],
-                            "Status": s["status"],
-                            "Fehlende Noten": missing_str
-                        }
-                        export_rows.append(row)
-                        sheets_data[klasse].append(row)
+                # Für Fehlliste nur unvollständige Einträge
+                if final_status != "Unvollständig":
+                    continue
 
-            # 4. Excel generieren
+                missing_details = []
+                student_subjects = subjects_local_map.get(s_id, {})
+                for fach in sorted(student_subjects.keys()):
+                    vals = student_subjects[fach]
+                    av_ok = bool(vals.get("av"))
+                    sv_ok = bool(vals.get("sv"))
+                    if av_ok and sv_ok:
+                        continue
+
+                    teachers = sorted(class_subject_teachers.get(str(klasse), {}).get(fach, set()))
+                    teacher_text = ", ".join(teachers) if teachers else "-"
+                    if (not av_ok) and (not sv_ok):
+                        miss = "AV+SV fehlen"
+                    elif not av_ok:
+                        miss = "AV fehlt"
+                    else:
+                        miss = "SV fehlt"
+                    missing_details.append(f"{fach} [{teacher_text}] ({miss})")
+
+                # Fallback falls Status unvollständig ist, aber keine fachscharfen Lücken ermittelt wurden
+                if not missing_details:
+                    expected_notes = (target or 0) * 2 if target else (faecher_count or 0) * 2
+                    diff = max(0, expected_notes - current_notes)
+                    if diff > 0:
+                        missing_details.append(f"Nicht zuordenbare Lücken: {diff} Note(n)")
+                    else:
+                        missing_details.append("Unvollständig laut Statuslogik")
+
+                row = {
+                    "Klasse": klasse,
+                    "Name": name,
+                    "Soll-Fächer": target,
+                    "AV-Noten": av_count or 0,
+                    "SV-Noten": sv_count or 0,
+                    "Status": final_status,
+                    "SPH-Abgleich": sph_text,
+                    "Fehlende Fächer / Lehrkräfte": " | ".join(missing_details),
+                }
+                export_rows.append(row)
+                sheets_data[str(klasse)].append(row)
+
             if not export_rows:
-                messagebox.showinfo("Info", "Keine Schüler mit Status 'Unvollständig' gefunden.")
+                messagebox.showinfo("Info", "Keine Schüler mit Status 'Unvollständig' für den Export gefunden.")
                 return
 
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                # Gesamtübersicht
+            with pd.ExcelWriter(filename, engine="openpyxl") as writer:
                 df_gesamt = pd.DataFrame(export_rows)
                 df_gesamt.to_excel(writer, sheet_name="Gesamtübersicht", index=False)
-                
-                # Sheets pro Klasse
+
                 for klasse, rows in sheets_data.items():
                     df_klasse = pd.DataFrame(rows)
-                    df_klasse.to_excel(writer, sheet_name=str(klasse), index=False)
-            
-            # Formatting (Nachträglich anwenden)
-            from copy import copy
-            from openpyxl.utils import get_column_letter
-            
-            workbook = writer.book
-            for sheet_name in workbook.sheetnames:
-                ws = workbook[sheet_name]
-                
-                # Iterate columns
-                for col in ws.columns:
-                    column = col[0].column_letter # Get the column name
-                    
-                    # Special handling for "Fehlende Noten"
-                    header_cell = ws[f"{column}1"]
-                    if header_cell.value == "Fehlende Noten":
-                         ws.column_dimensions[column].width = 60
-                    else:
-                         ws.column_dimensions[column].width = 15
+                    df_klasse.to_excel(writer, sheet_name=str(klasse)[:31], index=False)
 
-                    if header_cell.value == "Fehlende Noten":
+                workbook = writer.book
+                for sheet_name in workbook.sheetnames:
+                    ws = workbook[sheet_name]
+                    for col in ws.columns:
+                        column = col[0].column_letter
+                        header_cell = ws[f"{column}1"]
+                        if header_cell.value in ["Name", "SPH-Abgleich"]:
+                            ws.column_dimensions[column].width = 28
+                        elif header_cell.value == "Fehlende Fächer / Lehrkräfte":
+                            ws.column_dimensions[column].width = 80
+                        elif header_cell.value in ["Status", "Klasse"]:
+                            ws.column_dimensions[column].width = 16
+                        else:
+                            ws.column_dimensions[column].width = 14
                         for cell in col:
-                            # Fix DeprecationWarning
                             new_align = copy(cell.alignment)
                             new_align.wrap_text = True
                             cell.alignment = new_align
+                    ws.page_setup.orientation = "landscape"
+                    ws.page_setup.fitToWidth = 1
 
-                # Page Setup
-                ws.page_setup.orientation = "portrait"
-                ws.page_setup.fitToWidth = 1
-                
-            workbook.save(filename)
-                    
-            messagebox.showinfo("Export erfolgreich", f"Datei erstellt:\n{filename.name}\n({len(export_rows)} Einträge)")
+            self.log_to_export(f"Fehlliste exportiert: {filename}")
+            messagebox.showinfo(
+                "Export erfolgreich",
+                f"Datei erstellt:\n{filename}\n({len(export_rows)} Einträge)"
+            )
+            try:
+                if os.name == "nt":
+                    os.startfile(str(output_dir))
+            except Exception:
+                pass
 
         except Exception as e:
             logging.error(f"Fehler beim Listen-Export: {e}")
@@ -3653,6 +3700,7 @@ class KopfnotenGUI:
                 "AV-Noten",
                 "SV-Noten",
                 "Status",
+                "SPH-Abgleich",
             ]
             self.analysis_tree["columns"] = columns
             self.analysis_tree.column("#0", width=0, stretch=False)
@@ -3661,7 +3709,7 @@ class KopfnotenGUI:
                 self.analysis_tree.heading(col, text=col)
                 if col == "Name":
                      self.analysis_tree.column(col, width=150)
-                elif col == "Status":
+                elif col in ["Status", "SPH-Abgleich"]:
                      self.analysis_tree.column(col, width=120)
                 else:
                      self.analysis_tree.column(col, width=80)
@@ -3729,6 +3777,7 @@ class KopfnotenGUI:
                         
                         sm["raw_subjects"].append({
                             "f_kurz": f_kurz,
+                            "f_lang": f_lang,
                             "f_typ": f_typ,
                             "av": av,
                             "sv": sv,
@@ -3746,6 +3795,7 @@ class KopfnotenGUI:
                     if "raw_subjects" not in sm: continue
                     
                     raw_list = sm["raw_subjects"]
+                    sm["subjects_local"] = {}
                     
                     # Jahrgang ermitteln (aus Klasse)
                     klasse = sm["klasse"]
@@ -3765,6 +3815,7 @@ class KopfnotenGUI:
                     
                     for r in raw_list:
                          f_kurz = r["f_kurz"]
+                         f_lang = r["f_lang"]
                          f_typ = r["f_typ"]
                          av = r["av"]
                          sv = r["sv"]
@@ -3805,6 +3856,16 @@ class KopfnotenGUI:
                                  # Rel/Eth is handled by REL_TRIAD.
                                  # For others: "Deutsch" is "Deutsch".
                                  sm["dedup_subjects"].add(clean_name)
+
+                         # Für SPH-Abgleich: fachnahe Rohbezeichnung pro Lernendem sammeln
+                         local_subject_name = (f_lang or f_kurz or "").strip()
+                         if local_subject_name:
+                             if local_subject_name not in sm["subjects_local"]:
+                                 sm["subjects_local"][local_subject_name] = {"av": False, "sv": False}
+                             if av is not None:
+                                 sm["subjects_local"][local_subject_name]["av"] = True
+                             if sv is not None:
+                                 sm["subjects_local"][local_subject_name]["sv"] = True
                          
                          if av is not None: sm["av_count"] += 1
                          if sv is not None: sm["sv_count"] += 1
@@ -3854,6 +3915,11 @@ class KopfnotenGUI:
                         final_target = s["target_subjects_db"] if s["target_subjects_db"] else self.get_default_target_for_grade(jahrgang)
                         
                         status = self._calculate_status(jahrgang, current_notes, s["faecher_count"], final_target)
+                        sph_alignment, row_tag, sph_status_override = self._get_sph_alignment_for_student(
+                            s["klasse"], s.get("subjects_local", {}), status
+                        )
+                        if sph_status_override:
+                            status = sph_status_override
 
                         # STATUS FILTER
                         status_filter_val = self.status_filter_var.get()
@@ -3951,8 +4017,10 @@ class KopfnotenGUI:
                                 final_target, # Zeige SOLL anstatt IST (User Request)
                                 s["av_count"],
                                 s["sv_count"],
-                                status
-                            )
+                                status,
+                                sph_alignment
+                            ),
+                            tags=(row_tag,) if row_tag else ()
                         )
 
 
@@ -3961,6 +4029,97 @@ class KopfnotenGUI:
             logging.error(f"Fehler beim Aktualisieren der Analyse-Daten: {e}")
             import traceback
             traceback.print_exc()
+
+    def _normalize_class_for_sph(self, klasse: str) -> str:
+        """Normalisiert Klassenkennung für SPH-Map (z. B. 05a -> 05A, daz2 -> DAZ2)."""
+        if not klasse:
+            return ""
+        k = str(klasse).strip()
+        m = re.match(r"^(\d{1,2})([a-zA-Z])$", k)
+        if m:
+            return f"{int(m.group(1)):02d}{m.group(2).upper()}"
+        if k.lower().startswith("daz"):
+            return k.upper()
+        return k.upper()
+
+    def _get_sph_alignment_for_student(self, klasse: str, subjects_local: Dict[str, Dict[str, bool]], local_status: str):
+        """
+        SPH-Abgleich je Lernendem.
+        Rückgabe: (anzeigetext, row_tag, status_override)
+        """
+        # Vollständige Lernende bleiben grün (kein klassenweises Rot-Override).
+        if local_status == "Vollständig":
+            return "SPH: vollständig", "student_green", "Vollständig"
+
+        cls_key = self._normalize_class_for_sph(klasse)
+        data = self.sph_missing_overview.get(cls_key)
+        if not data:
+            return "Kein SPH-Abgleich", None, None
+
+        rows = data.get("rows", [])
+        if not rows:
+            return "Kein SPH-Abgleich", None, None
+
+        def norm_subject(text: str) -> str:
+            return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+        def subjects_match(local_subject: str, sph_subject: str) -> bool:
+            a = norm_subject(local_subject)
+            b = norm_subject(sph_subject)
+            if not a or not b:
+                return False
+            # Kurze Kürzel nur exakt vergleichen, um Zufallstreffer zu vermeiden.
+            if len(a) < 4 or len(b) < 4:
+                return a == b
+            return a == b or a in b or b in a
+
+        matched_rows = []
+        for row in rows:
+            sph_subject = row.get("fach_raw", "")
+            for local_subject, vals in subjects_local.items():
+                if subjects_match(local_subject, sph_subject):
+                    matched_rows.append((row, vals))
+                    break
+
+        # Kein verwertbarer Fach-Match: lokaler Status bleibt maßgeblich.
+        if not matched_rows:
+            if local_status == "Vollständig":
+                return "SPH: vollständig", "student_green", "Vollständig"
+            return "SPH: Einzelnoten fehlen", "student_yellow", "Unvollständig"
+
+        has_red = False
+        has_yellow = False
+        has_any_complete = False
+
+        for row, vals in matched_rows:
+            color = row.get("farbe")
+            av_ok = bool(vals.get("av"))
+            sv_ok = bool(vals.get("sv"))
+            full_missing = (not av_ok and not sv_ok)
+            partial_missing = (av_ok != sv_ok)
+            complete = (av_ok and sv_ok)
+
+            if complete:
+                has_any_complete = True
+
+            if color == "rot":
+                if full_missing:
+                    has_red = True
+                elif partial_missing:
+                    has_yellow = True
+            elif color == "gelb":
+                if full_missing or partial_missing:
+                    has_yellow = True
+
+        # Priorität: rot > gelb > grün
+        if has_red:
+            return "SPH: Kurs fehlt", "student_red", "Unvollständig"
+        if has_yellow or local_status == "Unvollständig":
+            return "SPH: Einzelnoten fehlen", "student_yellow", "Unvollständig"
+        if has_any_complete:
+            return "SPH: vollständig", "student_green", "Vollständig"
+
+        return "SPH: vollständig", "student_green", "Vollständig"
 
     def _calculate_status(self, jahrgang: int, current_notes: int, faecher_count: int, target_subjects: int = None) -> str:
         """
@@ -3999,7 +4158,7 @@ class KopfnotenGUI:
         if jahrgang in [5, 6]: return 9
         elif jahrgang == 7: return 10
         elif jahrgang == 8: return 11
-        elif jahrgang == 9: return 14
+        elif jahrgang == 9: return 13
         elif jahrgang == 10: return 13
         return 0 if is_complete else "Unvollständig"
 
@@ -4066,7 +4225,7 @@ class KopfnotenGUI:
         filename = filedialog.askopenfilename(
             title="Datenbank öffnen",
             filetypes=[("SQLite-Datenbank", "*.db"), ("Alle Dateien", "*.*")],
-            initialdir=str(Path("output_database").resolve()),
+            initialdir=str(self.paths.database_path.parent.resolve()),
         )
         if filename:
             self.db_path = Path(filename)
@@ -4106,9 +4265,27 @@ Inhalt:
         except Exception as e:
             messagebox.showerror("Datenbankfehler", f"Fehler: {e}")
 
+    def backup_database(self):
+        """Erstellt eine Zeitstempel-Sicherung der aktiven Datenbank."""
+        if not self.db_path.exists():
+            messagebox.showwarning("Keine Datenbank", "Es gibt keine Datenbank zum Sichern.")
+            return
+
+        try:
+            self.path_manager.ensure_directory(self.paths.backup_dir)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = self.paths.backup_dir / f"{self.db_path.stem}_{ts}.db"
+            shutil.copy2(self.db_path, backup_file)
+            messagebox.showinfo(
+                "Sicherung erstellt",
+                f"Datenbank wurde gesichert:\n{backup_file}",
+            )
+        except Exception as e:
+            messagebox.showerror("Sicherungsfehler", f"Datenbank-Sicherung fehlgeschlagen:\n{e}")
+
     def show_logs(self):
         """Zeigt Logs"""
-        log_dir = Path("logs")
+        log_dir = self.paths.logs_dir
         if not log_dir.exists():
             messagebox.showinfo("Keine Logs", "Keine Log-Dateien gefunden.")
             return
@@ -4140,10 +4317,10 @@ Inhalt:
         """Prüft Berechtigungen"""
         try:
             dirs = [
-                Path("templates"),
-                Path("output_word"),
-                Path("output_database"),
-                Path("logs"),
+                self.paths.templates_dir,
+                self.paths.output_word_dir,
+                self.paths.database_path.parent,
+                self.paths.logs_dir,
             ]
             report = []
             for directory in dirs:
@@ -4364,10 +4541,7 @@ def main():
     """Hauptfunktion"""
     try:
         # Verzeichnisse erstellen
-        Path("logs").mkdir(exist_ok=True)
-        Path("templates").mkdir(exist_ok=True)
-        Path("output_word").mkdir(exist_ok=True)
-        Path("output_database").mkdir(exist_ok=True)
+        APP_PATHS.ensure_runtime_dirs()
         # Anwendung starten
         app = KopfnotenGUI()
         app.root.mainloop()

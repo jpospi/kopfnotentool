@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives import hashes
 from typing import Optional, Tuple, Dict
 
 from sph_downloader import SPHDownloader
+from app_paths import load_app_paths
 
 logger = logging.getLogger("credentials")
 
@@ -22,7 +23,9 @@ class CredentialManager:
     SECRET_FILE = "secret.dat"
     ITERATIONS = 480000 # High iteration count for security
     
-    def __init__(self, data_dir: str = "temp"):
+    def __init__(self, data_dir: Optional[str] = None):
+        if data_dir is None:
+            data_dir = str(load_app_paths().temp_dir)
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True, parents=True)
         self.secret_path = self.data_dir / self.SECRET_FILE
@@ -66,9 +69,15 @@ class CredentialManager:
             return True, "Login erfolgreich (Online)."
             
         except ConnectionError as e:
-            # Maybe offline?
-            logger.info(f"Online login failed, trying offline verification: {e}")
-            return self._verify_offline(school_id, username, password)
+            # Always try online first; offline fallback only if local credentials exist.
+            logger.info(f"Online login failed: {e}")
+            if self.secret_path.exists():
+                logger.info("Offline data found, trying offline verification.")
+                return self._verify_offline(school_id, username, password)
+            return False, (
+                "Online-Anmeldung fehlgeschlagen und keine Offline-Daten vorhanden. "
+                "Bitte Internetverbindung prüfen und erneut anmelden."
+            )
             
         except ValueError as e:
              # Specifically for authentication failures
@@ -79,7 +88,8 @@ class CredentialManager:
             # Other errors
             logger.error(f"Login error: {e}")
             if self.secret_path.exists():
-                 return self._verify_offline(school_id, username, password)
+                logger.info("Trying offline verification after unexpected online error.")
+                return self._verify_offline(school_id, username, password)
             return False, f"Login fehlgeschlagen: {e}"
 
     def _save_credentials(self, school_id: str, username: str, password: str):

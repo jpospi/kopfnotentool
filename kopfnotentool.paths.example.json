@@ -1,0 +1,12 @@
+{
+  "data_root": "C:/KopfnotenToolData",
+  "import_dir": "C:/KopfnotenToolData/input_excel",
+  "output_word_dir": "C:/KopfnotenToolData/output_word",
+  "output_excel_dir": "C:/KopfnotenToolData/output_excel",
+  "templates_dir": "C:/KopfnotenToolData/templates",
+  "logs_dir": "C:/KopfnotenToolData/logs",
+  "temp_dir": "C:/KopfnotenToolData/temp",
+  "database_path": "C:/KopfnotenToolData/output_database/kopfnoten_secure.db",
+  "backup_dir": "D:/KopfnotenToolBackups",
+  "sph_config_path": "C:/KopfnotenToolData/sph_config.json"
+}
