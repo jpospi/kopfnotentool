@@ -2497,10 +2497,6 @@ class KopfnotenGUI:
              messagebox.showerror("Konfigurationsfehler", f"Formatfehler: {e}")
              return
 
-        if not tasks:
-            messagebox.showerror("Konfigurationsfehler", "Keine Züge ausgewählt (Alle auf 0?).")
-            return
-            
         # Speichern (Nur Config, nicht user/pw da jetzt secured)
         self.save_sph_config()
 
@@ -2519,22 +2515,33 @@ class KopfnotenGUI:
             downloader.login(school, user, pw)
             
             # Download Loop
-            downloaded_files = []
             output_dir = self.paths.temp_dir
             output_dir.mkdir(parents=True, exist_ok=True)
-            
-            letters = "abcdefghijklmnopqrstuvwxyz"
-            
-            for jg, count in tasks:
-                for i in range(count):
-                    suffix = letters[i]
-                    class_name = f"{jg}{suffix}" # 05a
-                    
-                    self.queue_ui(self.status_manager.set_status, f"Lade Klasse {class_name}...")
-                    
-                    file_path = downloader.download_class_list(class_name, jg, output_dir)
-                    if file_path:
-                        downloaded_files.append(file_path)
+
+            # 1) Primär: Autoerkennung (ohne manuelle Vorgabe)
+            self.queue_ui(self.status_manager.set_status, "Autoerkenne Klassen aus SPH...")
+            downloaded_files, _auto_tasks = self._auto_detect_and_download_classes(
+                downloader, output_dir
+            )
+
+            # 2) Backup-Fallback: manuelle Angaben nutzen, falls Autoerkennung nichts gefunden hat
+            if not downloaded_files:
+                if tasks:
+                    self.queue_ui(
+                        self.status_manager.set_status,
+                        "Autoerkennung ohne Treffer – nutze manuelle Klassenangaben (Backup)...",
+                    )
+                    downloaded_files = self._download_manual_tasks(
+                        downloader, output_dir, tasks
+                    )
+                else:
+                    self.queue_ui(
+                        messagebox.showwarning,
+                        "SPH Import",
+                        "Autoerkennung hat keine Klassen gefunden und es wurden keine manuellen Klassenzahlen angegeben.",
+                    )
+                    self.queue_ui(self.status_manager.set_status, "SPH Import ohne Ergebnis")
+                    return
             
             # Import Trigger
             if downloaded_files:
@@ -2596,6 +2603,57 @@ class KopfnotenGUI:
                 messagebox.showinfo("SPH Import", f"{count} Klassen erfolgreich importiert.")
         except Exception as e:
             messagebox.showerror("Import Fehler", f"{e}")
+
+    def _download_manual_tasks(self, downloader, output_dir: Path, tasks: List[Tuple[str, int]]) -> List[Path]:
+        """Lädt Klassen anhand manueller Konfiguration (Backup-Pfad)."""
+        downloaded_files: List[Path] = []
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        for jg, count in tasks:
+            for i in range(count):
+                suffix = letters[i]
+                class_name = f"{jg}{suffix}"
+                self.queue_ui(self.status_manager.set_status, f"Lade Klasse {class_name} (manuell)...")
+                file_path = downloader.download_class_list(class_name, jg, output_dir)
+                if file_path:
+                    downloaded_files.append(file_path)
+        return downloaded_files
+
+    def _auto_detect_and_download_classes(self, downloader, output_dir: Path) -> Tuple[List[Path], List[Tuple[str, int]]]:
+        """
+        Erkennt Klassen pro Jahrgang automatisch durch sequenzielles Testen (05a, 05b, ...).
+        Stoppt je Jahrgang nach 2 Fehlversuchen in Folge nach erstem Treffer.
+        """
+        downloaded_files: List[Path] = []
+        detected_tasks: List[Tuple[str, int]] = []
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        years = sorted(self.spinboxes.keys()) if hasattr(self, "spinboxes") else [5, 6, 7, 8, 9, 10]
+
+        for year in years:
+            jg = f"{int(year):02d}"
+            success_count = 0
+            fail_streak = 0
+
+            # Sicherheitsgrenze je Jahrgang (max. 12 Klassen)
+            for i in range(12):
+                class_name = f"{jg}{letters[i]}"
+                self.queue_ui(self.status_manager.set_status, f"Autocheck Klasse {class_name}...")
+                file_path = downloader.download_class_list(class_name, jg, output_dir)
+
+                if file_path:
+                    downloaded_files.append(file_path)
+                    success_count += 1
+                    fail_streak = 0
+                else:
+                    fail_streak += 1
+                    if success_count == 0 and fail_streak >= 1:
+                        break
+                    if success_count > 0 and fail_streak >= 2:
+                        break
+
+            if success_count > 0:
+                detected_tasks.append((jg, success_count))
+
+        return downloaded_files, detected_tasks
 
     def _sph_post_import_sync_worker(self, school, user, pw):
         """Lädt SPH-Abgleich im Anschluss an einen erfolgreichen Import."""
