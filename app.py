@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import re
 import io
+import statistics
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -24,6 +25,8 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from app_paths import load_app_paths
 
 APP_PATHS = load_app_paths()
+DEFAULT_SCHOOL_YEAR = "2024/2025"
+DEFAULT_TERM = 1
 
 # Ensure temp directory exists with proper permissions
 temp_dir = APP_PATHS.temp_dir
@@ -46,6 +49,11 @@ logging.basicConfig(
 )
 
 # Globale Konstanten
+TEMPLATE_MANAGER_ENABLED = False  # UI aus; Code bleibt für spätere Wiederaktivierung
+GITHUB_REPO_URL = "https://github.com/jpospi/kopfnotentool"
+MAX_CLASSES_PER_JAHRGANG = 9  # Autoimport bis 9 Züge (05a … 05i)
+CLASS_SUFFIX_LETTERS = "abcdefghi"
+
 FAECHER_MAPPING = {
     # Deutsch
     "De": "Deutsch",
@@ -450,11 +458,13 @@ SV-Note: {% for note in schueler.sv_noten %}{{note}}{% if not loop.last %} | {% 
 
 class KopfnotenImporter:
     """Import-Klasse für Excel-Dateien"""
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, school_year: str = DEFAULT_SCHOOL_YEAR, term: int = DEFAULT_TERM):
         self.db_path = Path(db_path)
         self.conn = None
         self.faecher_cache = {}
         self.logger = logging.getLogger("importer")
+        self.school_year = school_year
+        self.term = int(term)
 
     def __enter__(self):
         self.conn = self._create_database()
@@ -476,7 +486,8 @@ class KopfnotenImporter:
                 name TEXT NOT NULL,
                 klasse TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                target_subjects INTEGER, 
+                target_subjects INTEGER,
+                is_active BOOLEAN DEFAULT 1,
                 UNIQUE(name, klasse)
             );
 
@@ -496,6 +507,10 @@ class KopfnotenImporter:
                 fach_id INTEGER NOT NULL,
                 note_av INTEGER CHECK(note_av BETWEEN 1 AND 6),
                 note_sv INTEGER CHECK(note_sv BETWEEN 1 AND 6),
+                note_av_special TEXT,
+                note_sv_special TEXT,
+                manual_av_lock BOOLEAN DEFAULT 0,
+                manual_sv_lock BOOLEAN DEFAULT 0,
                 ist_wahlpflicht_belegung BOOLEAN DEFAULT 0,
                 lehrer_kuerzel TEXT,
                 schuljahr TEXT DEFAULT '2024/2025',
@@ -518,9 +533,35 @@ class KopfnotenImporter:
             columns = [info[1] for info in cursor.fetchall()]
             if "target_subjects" not in columns:
                 conn.execute("ALTER TABLE schueler ADD COLUMN target_subjects INTEGER")
+            if "is_active" not in columns:
+                conn.execute("ALTER TABLE schueler ADD COLUMN is_active BOOLEAN DEFAULT 1")
                 conn.commit()
         except Exception as e:
             logging.error(f"Migration error (target_subjects): {e}")
+
+        # Migration: manuelle Noten-Priorität (Locks je AV/SV)
+        try:
+            cursor = conn.execute("PRAGMA table_info(noten)")
+            note_columns = [info[1] for info in cursor.fetchall()]
+            if "manual_av_lock" not in note_columns:
+                conn.execute("ALTER TABLE noten ADD COLUMN manual_av_lock BOOLEAN DEFAULT 0")
+            if "manual_sv_lock" not in note_columns:
+                conn.execute("ALTER TABLE noten ADD COLUMN manual_sv_lock BOOLEAN DEFAULT 0")
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Migration error (manual lock columns): {e}")
+
+        # Migration: Sonderkürzel für Noten (z.B. GB/NF)
+        try:
+            cursor = conn.execute("PRAGMA table_info(noten)")
+            note_columns = [info[1] for info in cursor.fetchall()]
+            if "note_av_special" not in note_columns:
+                conn.execute("ALTER TABLE noten ADD COLUMN note_av_special TEXT")
+            if "note_sv_special" not in note_columns:
+                conn.execute("ALTER TABLE noten ADD COLUMN note_sv_special TEXT")
+            conn.commit()
+        except Exception as e:
+            logging.error(f"Migration error (special note columns): {e}")
 
         # Migration: Geschichte/Gesellschaftskunde -> Gesellschaftslehre
         conn.execute(
@@ -529,8 +570,8 @@ class KopfnotenImporter:
         conn.commit()
         return conn
 
-    def _parse_note_mit_wahlpflicht(self, note_str: str) -> Tuple[Optional[int], bool, Optional[str]]:
-        """Extrahiert Note, Wahlpflicht-Flag und Lehrer-Kürzel aus einem Notenwert
+    def _parse_note_mit_wahlpflicht(self, note_str: str) -> Tuple[Optional[int], Optional[str], bool, Optional[str]]:
+        """Extrahiert Note/Sonderkürzel, Wahlpflicht-Flag und Lehrer-Kürzel aus einem Notenwert
         
         Format: Note kann alleine oder mit Lehrer-Kürzel vorkommen:
         - "3" -> (3, False, None)
@@ -539,7 +580,7 @@ class KopfnotenImporter:
         - "2 (W)\nMÜL" -> (2, True, "MÜL")
         """
         if pd.isna(note_str) or note_str == "":
-            return None, False, None
+            return None, None, False, None
         
         note_str = str(note_str).strip()
         
@@ -577,9 +618,11 @@ class KopfnotenImporter:
                 lehrer_kuerzel = None
 
         if note_part.startswith("-"):
-            return None, ist_wahlpflicht, lehrer_kuerzel
-        if "GB" in note_part.upper():
-            return None, ist_wahlpflicht, lehrer_kuerzel
+            return None, None, ist_wahlpflicht, lehrer_kuerzel
+
+        special_match = re.search(r"\b(GB|NF)\b", note_part, re.IGNORECASE)
+        if special_match:
+            return None, special_match.group(1).upper(), ist_wahlpflicht, lehrer_kuerzel
             
         decimal_match = re.search(r"(\d+\.?\d*)", note_part)
         if decimal_match:
@@ -587,7 +630,7 @@ class KopfnotenImporter:
                 note_float = float(decimal_match.group(1))
                 note = int(round(note_float))
                 if 1 <= note <= 6:
-                    return note, ist_wahlpflicht, lehrer_kuerzel
+                    return note, None, ist_wahlpflicht, lehrer_kuerzel
             except ValueError:
                 pass
                 
@@ -596,11 +639,11 @@ class KopfnotenImporter:
             try:
                 note = int(digit_match.group(1))
                 if 1 <= note <= 6:
-                    return note, ist_wahlpflicht, lehrer_kuerzel
+                    return note, None, ist_wahlpflicht, lehrer_kuerzel
             except ValueError:
                 pass
                 
-        return None, ist_wahlpflicht, lehrer_kuerzel
+        return None, None, ist_wahlpflicht, lehrer_kuerzel
 
     def _extract_wahlpflicht_gruppe(self, fach_name: str) -> Tuple[str, Optional[str]]:
         """Extrahiert Wahlpflichtgruppe aus Fachnamen"""
@@ -757,10 +800,11 @@ class KopfnotenImporter:
 
                 for col_idx, fach_kurz, fach_typ in fach_columns_clean:
                     note_raw = row.iloc[col_idx]
-                    note, ist_wahlpflicht, lehrer_kuerzel = self._parse_note_mit_wahlpflicht(note_raw)
-                    if note is not None or ist_wahlpflicht:
+                    note, special_note, ist_wahlpflicht, lehrer_kuerzel = self._parse_note_mit_wahlpflicht(note_raw)
+                    if note is not None or special_note is not None or ist_wahlpflicht:
                         schueler_noten[name][art][(fach_kurz, fach_typ)] = {
                             "note": note,
+                            "special_note": special_note,
                             "ist_wahlpflicht": ist_wahlpflicht,
                             "lehrer_kuerzel": lehrer_kuerzel
                         }
@@ -807,7 +851,7 @@ class KopfnotenImporter:
                         if not keys: return None
                         # 1. Bevorzuge Eintrag mit Note
                         for k in keys:
-                            if entries_dict[k]["note"] is not None:
+                            if entries_dict[k]["note"] is not None or entries_dict[k].get("special_note") is not None:
                                 return k
                         # 2. Bevorzuge Eintrag mit Lehrerkürzel
                         for k in keys:
@@ -817,7 +861,7 @@ class KopfnotenImporter:
                         return keys[0]
 
                     # Check if ANY Rel/Eth has a grade
-                    graded_keys = [k for k in all_rel_eth if entries[k]["note"] is not None]
+                    graded_keys = [k for k in all_rel_eth if entries[k]["note"] is not None or entries[k].get("special_note") is not None]
                     
                     if graded_keys:
                         # Wenn mindestens eine Note existiert, behalte NUR den besten benoteten Eintrag
@@ -858,13 +902,13 @@ class KopfnotenImporter:
                         # Platzhalter für Religion
                         rel_key = ("Religion", "evangelisch") 
                         if rel_key not in data_place["AV"]:
-                            data_place["AV"][rel_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
-                            data_place["SV"][rel_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["AV"][rel_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["SV"][rel_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
                         # Platzhalter für Ethik
                         eth_key = ("Ethik", None)
                         if eth_key not in data_place["AV"]:
-                            data_place["AV"][eth_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
-                            data_place["SV"][eth_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["AV"][eth_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
+                            data_place["SV"][eth_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": None}
                         
                         # Update local sets to prevent re-adding below
                         current_faecher_kurz.add("Religion")
@@ -881,8 +925,8 @@ class KopfnotenImporter:
                                     continue
                             
                             lehrer = default_lehrer[f_key]
-                            data_place["AV"][f_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
-                            data_place["SV"][f_key] = {"note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
+                            data_place["AV"][f_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
+                            data_place["SV"][f_key] = {"note": None, "special_note": None, "ist_wahlpflicht": False, "lehrer_kuerzel": lehrer}
                             
                             # Update local set
                             current_faecher_keys.add(f_key)
@@ -915,6 +959,8 @@ class KopfnotenImporter:
                     sv_data = noten_data.get("SV", {}).get((fach_kurz, fach_typ), {})
                     note_av = av_data.get("note")
                     note_sv = sv_data.get("note")
+                    note_av_special = av_data.get("special_note")
+                    note_sv_special = sv_data.get("special_note")
                     
                     # WP belegung ist wahr wenn entweder in der Zelle markiert ODER global am Fach
                     ist_wahlpflicht_belegung = (
@@ -929,24 +975,48 @@ class KopfnotenImporter:
                     if (
                         note_av is not None
                         or note_sv is not None
+                        or note_av_special is not None
+                        or note_sv_special is not None
                         or ist_wahlpflicht_belegung
                         or True # Immer Platzhalter erlauben
                     ):
                         cursor = self.conn.execute(
-                            """SELECT noten_id FROM noten
+                            """SELECT
+                                   noten_id,
+                                   note_av,
+                                   note_sv,
+                                   note_av_special,
+                                   note_sv_special,
+                                   COALESCE(manual_av_lock, 0),
+                                   COALESCE(manual_sv_lock, 0)
+                               FROM noten
                                WHERE schueler_id = ? AND fach_id = ?
-                               AND schuljahr = '2024/2025' AND halbjahr = 1""",
-                            (schueler_id, fach_id),
+                               AND schuljahr = ? AND halbjahr = ?""",
+                            (schueler_id, fach_id, self.school_year, self.term),
                         )
                         existing = cursor.fetchone()
                         if existing:
+                            existing_note_av = existing[1]
+                            existing_note_sv = existing[2]
+                            existing_note_av_special = existing[3]
+                            existing_note_sv_special = existing[4]
+                            manual_av_lock = bool(existing[5])
+                            manual_sv_lock = bool(existing[6])
+                            final_note_av = existing_note_av if manual_av_lock else note_av
+                            final_note_sv = existing_note_sv if manual_sv_lock else note_sv
+                            final_note_av_special = existing_note_av_special if manual_av_lock else note_av_special
+                            final_note_sv_special = existing_note_sv_special if manual_sv_lock else note_sv_special
                             self.conn.execute(
                                 """UPDATE noten
-                                   SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?, lehrer_kuerzel = ?
+                                   SET note_av = ?, note_sv = ?,
+                                       note_av_special = ?, note_sv_special = ?,
+                                       ist_wahlpflicht_belegung = ?, lehrer_kuerzel = ?
                                    WHERE noten_id = ?""",
                                 (
-                                    note_av,
-                                    note_sv,
+                                    final_note_av,
+                                    final_note_sv,
+                                    final_note_av_special,
+                                    final_note_sv_special,
                                     ist_wahlpflicht_belegung,
                                     lehrer_kuerzel,
                                     existing[0],
@@ -955,15 +1025,19 @@ class KopfnotenImporter:
                         else:
                             self.conn.execute(
                                 """INSERT INTO noten
-                                   (schueler_id, fach_id, note_av, note_sv, ist_wahlpflicht_belegung, lehrer_kuerzel)
-                                   VALUES (?, ?, ?, ?, ?, ?)""",
+                                   (schueler_id, fach_id, note_av, note_sv, note_av_special, note_sv_special, ist_wahlpflicht_belegung, lehrer_kuerzel, schuljahr, halbjahr)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (
                                     schueler_id,
                                     fach_id,
                                     note_av,
                                     note_sv,
+                                    note_av_special,
+                                    note_sv_special,
                                     ist_wahlpflicht_belegung,
                                     lehrer_kuerzel,
+                                    self.school_year,
+                                    self.term,
                                 ),
                             )
                         noten_count += 1
@@ -1067,10 +1141,12 @@ class KopfnotenImporter:
 
 class OptimizedKopfnotenExporter:
     """Optimierter Exporter für horizontale 3-Zeilen-Tabellen mit korrekter erster Spalte"""
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, school_year: str = DEFAULT_SCHOOL_YEAR, term: int = DEFAULT_TERM):
         self.db_path = Path(db_path)
         self.conn = None
         self.logger = logging.getLogger("exporter")
+        self.school_year = school_year
+        self.term = int(term)
         if not self.db_path.exists():
             raise FileNotFoundError(f"Datenbank nicht gefunden: {self.db_path}")
 
@@ -1185,8 +1261,10 @@ class OptimizedKopfnotenExporter:
             
             av_val = row_dict["note_av"]
             sv_val = row_dict["note_sv"]
-            av_note = str(av_val) if av_val is not None else "-"
-            sv_note = str(sv_val) if sv_val is not None else "-"
+            av_special = row_dict.get("note_av_special")
+            sv_special = row_dict.get("note_sv_special")
+            av_note = av_special if av_special is not None else (str(av_val) if av_val is not None else "-")
+            sv_note = sv_special if sv_special is not None else (str(sv_val) if sv_val is not None else "-")
 
             is_rel_triad = (fach_kurz == "Ethik") or (fach_kurz == "Religion" and fach_typ in ["evangelisch", "katholisch"])
             
@@ -1194,9 +1272,9 @@ class OptimizedKopfnotenExporter:
             is_wpu_config = "WPU" in config_status
             is_wpu = is_wp or any(p in (wp_gruppe or "") for p in ["WPU", "WP"]) or is_wpu_config
 
-            if is_rel_triad and (av_val or sv_val):
+            if is_rel_triad and (av_val is not None or sv_val is not None or av_special is not None or sv_special is not None):
                 triad_grades[fach_lang] = {"av": av_note, "sv": sv_note}
-            if is_wpu and (av_val or sv_val):
+            if is_wpu and (av_val is not None or sv_val is not None or av_special is not None or sv_special is not None):
                 if fach_lang not in wpu_graded_list:
                     wpu_graded_list.append(fach_lang)
 
@@ -1632,15 +1710,21 @@ class OptimizedKopfnotenExporter:
             """
             SELECT
                 f.fach_lang,
+                f.fach_kurz,
+                f.fach_typ,
                 n.note_av,
                 n.note_sv,
+                n.note_av_special,
+                n.note_sv_special,
                 n.ist_wahlpflicht_belegung,
                 f.wahlpflicht_gruppe
             FROM noten n
             JOIN faecher f ON n.fach_id = f.fach_id
             WHERE n.schueler_id = ?
+              AND n.schuljahr = ?
+              AND n.halbjahr = ?
             """,
-            (schueler_id,),
+            (schueler_id, self.school_year, self.term),
         )
 
         rows = cursor.fetchall()
@@ -1663,12 +1747,16 @@ class OptimizedKopfnotenExporter:
 
         cursor = self.conn.execute(
             """
-            SELECT schueler_id, name
-            FROM schueler
-            WHERE klasse = ?
+            SELECT DISTINCT s.schueler_id, s.name
+            FROM schueler s
+            JOIN noten n ON s.schueler_id = n.schueler_id
+            WHERE s.klasse = ?
+              AND COALESCE(s.is_active, 1) = 1
+              AND n.schuljahr = ?
+              AND n.halbjahr = ?
             ORDER BY name
             """,
-            (klasse,),
+            (klasse, self.school_year, self.term),
         )
 
         schueler_liste = []
@@ -1683,15 +1771,21 @@ class OptimizedKopfnotenExporter:
                 """
                 SELECT
                     f.fach_lang,
+                    f.fach_kurz,
+                    f.fach_typ,
                     n.note_av,
                     n.note_sv,
+                    n.note_av_special,
+                    n.note_sv_special,
                     n.ist_wahlpflicht_belegung,
                     f.wahlpflicht_gruppe
                 FROM noten n
                 JOIN faecher f ON n.fach_id = f.fach_id
                 WHERE n.schueler_id = ?
+                  AND n.schuljahr = ?
+                  AND n.halbjahr = ?
                 """,
-                (schueler_id,),
+                (schueler_id, self.school_year, self.term),
             )
 
             rows = cursor.fetchall()
@@ -1817,6 +1911,8 @@ class SimplifiedGradeEditor:
                         "fach_kurz": subj_name[:3].upper(), # Generiert
                         "note_av": None,
                         "note_sv": None,
+                        "note_av_special": None,
+                        "note_sv_special": None,
                         "ist_wahlpflicht_belegung": 0,
                         "ist_wahlpflicht": 0,
                         "wahlpflicht_gruppe": None,
@@ -1841,7 +1937,12 @@ class SimplifiedGradeEditor:
                 if is_wpu:
                     existing_wpu_subjects.add(g["fach_lang"])
                     # Zählt nur wenn Note vorhanden
-                    if g["note_av"] is not None or g["note_sv"] is not None:
+                    if (
+                        g["note_av"] is not None
+                        or g["note_sv"] is not None
+                        or g.get("note_av_special") is not None
+                        or g.get("note_sv_special") is not None
+                    ):
                         graded_wpu_count += 1
             
             # Wenn WPU-Ziel NOCH NICHT erreicht ist -> Platzhalter anzeigen
@@ -1868,6 +1969,8 @@ class SimplifiedGradeEditor:
                             "fach_kurz": wpu["fach_kurz"],
                             "note_av": None,
                             "note_sv": None,
+                            "note_av_special": None,
+                            "note_sv_special": None,
                             "ist_wahlpflicht_belegung": 0, 
                             "ist_wahlpflicht": 1,
                             "wahlpflicht_gruppe": wpu["wahlpflicht_gruppe"],
@@ -1894,7 +1997,12 @@ class SimplifiedGradeEditor:
                     # - ODER WPU Fach ist Teil der benoteten (graded_wpu_count zählt ja nur Noten, aber vielleicht will man das Fach behalten?)
                     #   Eigentlich: Wenn unbenotet und WPU -> Weg.
                     
-                    has_grade = g["note_av"] is not None or g["note_sv"] is not None
+                    has_grade = (
+                        g["note_av"] is not None
+                        or g["note_sv"] is not None
+                        or g.get("note_av_special") is not None
+                        or g.get("note_sv_special") is not None
+                    )
                     
                     if not is_wpu:
                         cleaned_grades.append(g)
@@ -1918,6 +2026,9 @@ class SimplifiedGradeEditor:
     def _load_student_grades(self, student_id: int) -> List[Dict]:
         """Lädt Noten eines Schülers (korrigierte Version)"""
         try:
+            school_year, term = (DEFAULT_SCHOOL_YEAR, DEFAULT_TERM)
+            if self.app and hasattr(self.app, "_get_active_period"):
+                school_year, term = self.app._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row # Für Spaltenzugriff per Name
                 cursor = conn.execute(
@@ -1928,6 +2039,10 @@ class SimplifiedGradeEditor:
                         f.fach_kurz,
                         n.note_av,
                         n.note_sv,
+                        n.note_av_special,
+                        n.note_sv_special,
+                        COALESCE(n.manual_av_lock, 0) AS manual_av_lock,
+                        COALESCE(n.manual_sv_lock, 0) AS manual_sv_lock,
                         n.ist_wahlpflicht_belegung,
                         f.ist_wahlpflicht,
                         f.wahlpflicht_gruppe,
@@ -1935,9 +2050,11 @@ class SimplifiedGradeEditor:
                     FROM noten n
                     JOIN faecher f ON n.fach_id = f.fach_id
                     WHERE n.schueler_id = ?
+                      AND n.schuljahr = ?
+                      AND n.halbjahr = ?
                     ORDER BY f.fach_lang
                     """,
-                    (student_id,),
+                    (student_id, school_year, term),
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
@@ -2032,19 +2149,27 @@ class SimplifiedGradeEditor:
             lehrer = grade.get("lehrer_kuerzel") or "-"
             ttk.Label(scrollable_frame, text=lehrer).grid(row=row_idx, column=1, padx=10, pady=2, sticky=tk.W)
             
+            grade_options = ["", "1", "2", "3", "4", "5", "6", "GB", "NF"]
+
             # AV Note
-            av_var = tk.StringVar(value=str(grade["note_av"]) if grade["note_av"] else "")
-            av_entry = ttk.Entry(scrollable_frame, textvariable=av_var, width=5)
+            av_display = grade.get("note_av_special") or (str(grade["note_av"]) if grade["note_av"] is not None else "")
+            av_var = tk.StringVar(value=av_display)
+            av_entry = ttk.Combobox(
+                scrollable_frame, textvariable=av_var, values=grade_options, width=6, state="readonly"
+            )
             av_entry.grid(row=row_idx, column=2, padx=10, pady=2)
             
             # SV Note
-            sv_var = tk.StringVar(value=str(grade["note_sv"]) if grade["note_sv"] else "")
-            sv_entry = ttk.Entry(scrollable_frame, textvariable=sv_var, width=5)
+            sv_display = grade.get("note_sv_special") or (str(grade["note_sv"]) if grade["note_sv"] is not None else "")
+            sv_var = tk.StringVar(value=sv_display)
+            sv_entry = ttk.Combobox(
+                scrollable_frame, textvariable=sv_var, values=grade_options, width=6, state="readonly"
+            )
             sv_entry.grid(row=row_idx, column=3, padx=10, pady=2)
             
             # Status Label instead of Checkbox
             ttk.Label(scrollable_frame, text=status_text).grid(row=row_idx, column=4, padx=10, pady=2, sticky=tk.W)
-            
+
             vars_data = {
                 "noten_id": grade["noten_id"],
                 "av_var": av_var,
@@ -2052,12 +2177,14 @@ class SimplifiedGradeEditor:
                 "av_entry": av_entry,
                 "sv_entry": sv_entry,
                 "fach_name": fach_name,
+                "manual_av_lock": bool(grade.get("manual_av_lock", 0)),
+                "manual_sv_lock": bool(grade.get("manual_sv_lock", 0)),
 
                 "fach_kurz": fach_kurz,
                 "fach_typ": fach_typ,
                 "fach_id": grade.get("fach_id"), # Optional, für New WPU
                 "ist_wpu": is_wp,
-                "lehrer_kuerzel_hint": grade.get("lehrer_kuerzel") # Für Insert benötigt
+                "lehrer_kuerzel_hint": grade.get("lehrer_kuerzel"), # Für Insert benötigt
             }
             grade_vars[grade["noten_id"]] = vars_data
             
@@ -2081,7 +2208,7 @@ class SimplifiedGradeEditor:
             
             for v in group_vars:
                 # Disable if limit reached AND this one is not yet filled
-                state = "disabled" if (any_filled and v["noten_id"] != filled_id) else "normal"
+                state = "disabled" if (any_filled and v["noten_id"] != filled_id) else "readonly"
                 v["av_entry"].config(state=state)
                 v["sv_entry"].config(state=state)
 
@@ -2099,7 +2226,7 @@ class SimplifiedGradeEditor:
                 if len(filled_vars) >= limit and not is_filled:
                     state = "disabled"
                 else:
-                    state = "normal"
+                    state = "readonly"
                 v["av_entry"].config(state=state)
                 v["sv_entry"].config(state=state)
 
@@ -2125,6 +2252,9 @@ class SimplifiedGradeEditor:
         def save_all_grades():
             """Speichert alle Noten"""
             try:
+                school_year, term = (DEFAULT_SCHOOL_YEAR, DEFAULT_TERM)
+                if self.app and hasattr(self.app, "_get_active_period"):
+                    school_year, term = self.app._get_active_period()
                 with sqlite3.connect(self.db_path) as conn:
                     saved_count = 0
                     for noten_id, vars_dict in grade_vars.items():
@@ -2134,29 +2264,39 @@ class SimplifiedGradeEditor:
                         # Validiere und konvertiere Noten
                         av_value = None
                         sv_value = None
+                        av_special = None
+                        sv_special = None
                         if av_text:
-                            try:
-                                av_value = int(av_text)
-                                if not (1 <= av_value <= 6):
-                                    raise ValueError(
-                                        f"AV-Note für {vars_dict['fach_name']} muss zwischen 1 und 6 liegen"
-                                    )
-                            except ValueError:
-                                raise ValueError(f"Ungültige AV-Note für {vars_dict['fach_name']}")
+                            if av_text.upper() in {"GB", "NF"}:
+                                av_special = av_text.upper()
+                            else:
+                                try:
+                                    av_value = int(av_text)
+                                    if not (1 <= av_value <= 6):
+                                        raise ValueError(
+                                            f"AV-Note für {vars_dict['fach_name']} muss zwischen 1 und 6 liegen"
+                                        )
+                                except ValueError:
+                                    raise ValueError(f"Ungültige AV-Note für {vars_dict['fach_name']}")
                                 
                         if sv_text:
-                            try:
-                                sv_value = int(sv_text)
-                                if not (1 <= sv_value <= 6):
-                                    raise ValueError(
-                                        f"SV-Note für {vars_dict['fach_name']} muss zwischen 1 und 6 liegen"
-                                    )
-                            except ValueError:
-                                raise ValueError(f"Ungültige SV-Note für {vars_dict['fach_name']}")
+                            if sv_text.upper() in {"GB", "NF"}:
+                                sv_special = sv_text.upper()
+                            else:
+                                try:
+                                    sv_value = int(sv_text)
+                                    if not (1 <= sv_value <= 6):
+                                        raise ValueError(
+                                            f"SV-Note für {vars_dict['fach_name']} muss zwischen 1 und 6 liegen"
+                                        )
+                                except ValueError:
+                                    raise ValueError(f"Ungültige SV-Note für {vars_dict['fach_name']}")
 
                         # WPU-Status automatisch setzen:
                         # Wenn Fach WPU-fähig ist UND eine Note hat, ist es gewählt.
-                        wp_value = vars_dict.get("ist_wpu", False) and (av_value is not None or sv_value is not None)
+                        wp_value = vars_dict.get("ist_wpu", False) and (
+                            av_value is not None or sv_value is not None or av_special is not None or sv_special is not None
+                        )
 
                         # Speichere in Datenbank
                         if str(noten_id).startswith("new_wpu_") or str(noten_id).startswith("missing_"):
@@ -2166,17 +2306,29 @@ class SimplifiedGradeEditor:
                              # Aber wir haben fach_kurz und fach_lang.
                              
                              # Nur speichern, wenn auch wirklich was eingetragen wurde!
-                             if av_value is None and sv_value is None:
+                             if av_value is None and sv_value is None and av_special is None and sv_special is None:
                                  continue
                              
                              fach_id_target = vars_dict.get("fach_id")
                              if fach_id_target:
+                                 av_manual_lock = 1 if av_text else 0
+                                 sv_manual_lock = 1 if sv_text else 0
                                  conn.execute(
                                     """
-                                    INSERT INTO noten (schueler_id, fach_id, note_av, note_sv, ist_wahlpflicht_belegung, lehrer_kuerzel)
-                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    INSERT INTO noten (
+                                        schueler_id, fach_id, note_av, note_sv,
+                                        note_av_special, note_sv_special,
+                                        manual_av_lock, manual_sv_lock,
+                                        ist_wahlpflicht_belegung, lehrer_kuerzel, schuljahr, halbjahr
+                                    )
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                     """,
-                                    (student_id, fach_id_target, av_value, sv_value, wp_value, vars_dict.get("lehrer_kuerzel_hint"))
+                                    (
+                                        student_id, fach_id_target, av_value, sv_value,
+                                        av_special, sv_special,
+                                        av_manual_lock, sv_manual_lock,
+                                        wp_value, vars_dict.get("lehrer_kuerzel_hint"), school_year, term
+                                    )
                                  )
                                  saved_count += 1
                              else:
@@ -2184,13 +2336,25 @@ class SimplifiedGradeEditor:
                                  self.logger.error(f"Fehler: Keine fach_id für neuen WPU Eintrag {vars_dict['fach_name']}")
                         else:
                             # Normal UPDATE
+                            av_manual_lock = 1 if av_text else 0
+                            sv_manual_lock = 1 if sv_text else 0
                             conn.execute(
                                 """
                                 UPDATE noten
-                                SET note_av = ?, note_sv = ?, ist_wahlpflicht_belegung = ?
+                                SET note_av = ?, note_sv = ?,
+                                    note_av_special = ?, note_sv_special = ?,
+                                    ist_wahlpflicht_belegung = ?,
+                                    manual_av_lock = ?,
+                                    manual_sv_lock = ?
                                 WHERE noten_id = ?
+                                  AND schuljahr = ?
+                                  AND halbjahr = ?
                                 """,
-                                (av_value, sv_value, wp_value, noten_id),
+                                (
+                                    av_value, sv_value, av_special, sv_special, wp_value,
+                                    av_manual_lock, sv_manual_lock,
+                                    noten_id, school_year, term
+                                ),
                             )
                             saved_count += 1
 
@@ -2308,9 +2472,12 @@ class KopfnotenGUI:
         # New Filter Vars
         self.teacher_filter_var = tk.StringVar()
         self.status_filter_var = tk.StringVar(value="Alle")
+        self.current_school_year_var = tk.StringVar(value=DEFAULT_SCHOOL_YEAR)
+        self.current_term_var = tk.IntVar(value=DEFAULT_TERM)
 
         # Setup
         self.create_gui()
+        self.load_sph_missing_overview()
         self.load_initial_data()
         self.setup_linux_environment()
         self.process_ui_queue()
@@ -2349,6 +2516,12 @@ class KopfnotenGUI:
         style = ttk.Style()
         if "clam" in style.theme_names():
             style.theme_use("clam")
+        style.configure("TNotebook.Tab", padding=(14, 8), font=("Segoe UI", 10))
+        style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10))
+        style.configure("Card.TFrame", relief=tk.GROOVE, borderwidth=1)
+        style.configure("CardTitle.TLabel", font=("Segoe UI", 9), foreground="#4b5563")
+        style.configure("CardValue.TLabel", font=("Segoe UI Semibold", 14))
 
     def setup_linux_environment(self):
         """Linux-spezifische Umgebungseinrichtung"""
@@ -2384,14 +2557,117 @@ class KopfnotenGUI:
         self.create_import_tab()
         # self.create_sph_tab()  # SPH jetzt in Import
         self.create_analysis_tab()
+        self.create_insights_tab()
         self.create_export_tab()
-        self.create_template_tab()
+        if TEMPLATE_MANAGER_ENABLED:
+            self.create_template_tab()
         
         # Load Config
         self.load_sph_config()
         
         # Initial Status
         self.status_manager.set_status("Anwendung gestartet")
+
+    def _get_active_period(self) -> Tuple[str, int]:
+        return (self.current_school_year_var.get().strip() or DEFAULT_SCHOOL_YEAR, int(self.current_term_var.get() or 1))
+
+    def _get_active_period_key(self) -> str:
+        school_year, term = self._get_active_period()
+        return f"{school_year}|H{term}"
+
+    def _get_sph_cache_path(self) -> Path:
+        return self.paths.data_root / "sph_missing_overview.json"
+
+    def _suggest_school_years(self) -> List[str]:
+        now = datetime.now().year
+        return [f"{y}/{y + 1}" for y in range(now - 2, now + 3)]
+
+    def _refresh_period_label(self):
+        if hasattr(self, "period_info_label"):
+            school_year, term = self._get_active_period()
+            self.period_info_label.config(text=f"Aktive Periode: {school_year} (HJ {term})")
+
+    def _school_year_for_date(self, dt: datetime) -> str:
+        start_year = dt.year if dt.month >= 8 else dt.year - 1
+        return f"{start_year}/{start_year + 1}"
+
+    def _suggest_period_from_date(self, dt: Optional[datetime] = None) -> Dict[str, Any]:
+        dt = dt or datetime.now()
+        month = dt.month
+        school_year = self._school_year_for_date(dt)
+
+        if month == 1:
+            return {
+                "school_year": school_year,
+                "term": 1,
+                "confident": True,
+                "reason": "Januar-Fenster (Halbjahreszeugnisse)",
+            }
+        if month in (6, 7):
+            return {
+                "school_year": school_year,
+                "term": 2,
+                "confident": True,
+                "reason": "Juni/Juli-Fenster (Ganzjahreszeugnisse)",
+            }
+
+        # Fallback außerhalb der klaren Erfassungsfenster.
+        fallback_term = 1 if month <= 4 else 2
+        return {
+            "school_year": school_year,
+            "term": fallback_term,
+            "confident": False,
+            "reason": "Außerhalb Januar/Juni/Juli (bitte bestätigen)",
+        }
+
+    def _apply_period(self, school_year: str, term: int):
+        self.current_school_year_var.set(str(school_year).strip() or DEFAULT_SCHOOL_YEAR)
+        self.current_term_var.set(1 if int(term) == 1 else 2)
+        self.on_period_changed()
+
+    def _confirm_period_before_import(self, import_source: str) -> bool:
+        current_school_year, current_term = self._get_active_period()
+        suggestion = self._suggest_period_from_date()
+        suggested_school_year = suggestion["school_year"]
+        suggested_term = suggestion["term"]
+        confident = suggestion["confident"]
+
+        current_label = f"{current_school_year} / HJ {current_term}"
+        suggested_label = f"{suggested_school_year} / HJ {suggested_term}"
+
+        if confident:
+            if (current_school_year, current_term) != (suggested_school_year, suggested_term):
+                use_suggestion = messagebox.askyesno(
+                    "Periode prüfen",
+                    f"{import_source}: Empfohlene Periode ist {suggested_label}\n"
+                    f"(Grund: {suggestion['reason']}).\n\n"
+                    f"Aktuell eingestellt: {current_label}\n\n"
+                    "Soll auf die empfohlene Periode umgestellt werden?",
+                )
+                if use_suggestion:
+                    self._apply_period(suggested_school_year, suggested_term)
+            return True
+
+        decision = messagebox.askyesnocancel(
+            "Periode bestätigen",
+            f"{import_source}: Zeitraum liegt außerhalb der Standardfenster.\n\n"
+            f"Vorschlag: {suggested_label}\n"
+            f"Aktuell:   {current_label}\n\n"
+            "Ja = Vorschlag übernehmen\n"
+            "Nein = aktuelle Periode beibehalten\n"
+            "Abbrechen = Import stoppen",
+        )
+        if decision is None:
+            return False
+        if decision:
+            self._apply_period(suggested_school_year, suggested_term)
+        return True
+
+    def on_period_changed(self, event=None):
+        self.save_sph_config()
+        self.load_sph_missing_overview()
+        self._refresh_period_label()
+        self.refresh_all_data()
 
     # Old SPH Tab removed
 
@@ -2402,7 +2678,7 @@ class KopfnotenGUI:
     def add_recent_school(self, school_data): pass
 
     def load_sph_config(self):
-        """Lädt SPH Konfiguration (nur Klassen)"""
+        """Lädt SPH Konfiguration (Klassen + aktive Periode)."""
         try:
             import json
             config_path = self.paths.sph_config_path
@@ -2411,18 +2687,32 @@ class KopfnotenGUI:
                     config = json.load(f)
                 
                 # School/User logic moved to credentials.py / LoginWindow
+
+                period = config.get("period", {})
+                school_year = str(period.get("school_year", "")).strip()
+                term = period.get("term", DEFAULT_TERM)
+                if school_year:
+                    self.current_school_year_var.set(school_year)
+                try:
+                    term_int = int(term)
+                except (TypeError, ValueError):
+                    term_int = DEFAULT_TERM
+                if term_int not in (1, 2):
+                    term_int = DEFAULT_TERM
+                self.current_term_var.set(term_int)
                 
                 if "classes" in config:
                     classes = config["classes"]
                     for year, count in classes.items():
                         if int(year) in self.spinboxes:
                             self.spinboxes[int(year)].set(count)
+                self._refresh_period_label()
                             
         except Exception as e:
             logging.error(f"Fehler beim Laden der Config: {e}")
 
     def save_sph_config(self):
-        """Speichert SPH Konfiguration (nur Klassen)"""
+        """Speichert SPH Konfiguration (Klassen + aktive Periode)."""
         try:
             import json
             config_path = self.paths.sph_config_path
@@ -2439,6 +2729,11 @@ class KopfnotenGUI:
                 classes[str(year)] = spin.get()
             
             config["classes"] = classes
+            school_year, term = self._get_active_period()
+            config["period"] = {
+                "school_year": school_year,
+                "term": term,
+            }
             # Note: We rely on LoginWindow/Credentials to manage auth persistence.
             # We don't overwrite school/user here anymore because we don't have the widgets.
             
@@ -2447,6 +2742,87 @@ class KopfnotenGUI:
                 
         except Exception as e:
             logging.error(f"Fehler beim Speichern der Config: {e}")
+
+    def _load_db_transfer_meta(self) -> Dict[str, Any]:
+        """Lädt optionale Metadaten zu DB-Import/Export aus der Config."""
+        try:
+            config_path = self.paths.sph_config_path
+            if not config_path.exists():
+                return {}
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            meta = config.get("db_transfer", {})
+            return meta if isinstance(meta, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_db_transfer_meta(self, **kwargs):
+        """Speichert Metadaten zu DB-Import/Export in die Config."""
+        try:
+            config_path = self.paths.sph_config_path
+            config = {}
+            if config_path.exists():
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        config = json.load(f)
+                except Exception:
+                    config = {}
+
+            meta = config.get("db_transfer", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(kwargs)
+            config["db_transfer"] = meta
+
+            self.path_manager.ensure_directory(config_path.parent)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern der DB-Transfer-Metadaten: {e}")
+
+    def load_sph_missing_overview(self):
+        """Lädt den SPH-Abgleich für die aktive Periode."""
+        try:
+            self.sph_missing_overview = {}
+            cache_path = self._get_sph_cache_path()
+            if cache_path.exists():
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    if "periods" in data and isinstance(data.get("periods"), dict):
+                        self.sph_missing_overview = data["periods"].get(self._get_active_period_key(), {})
+                    else:
+                        # Backward compatibility: legacy cache without period split
+                        self.sph_missing_overview = data
+                    logging.info(
+                        f"SPH-Abgleich aus Cache geladen ({len(self.sph_missing_overview)} Klassen)."
+                    )
+        except Exception as e:
+            logging.error(f"Fehler beim Laden des SPH-Abgleich-Caches: {e}")
+
+    def save_sph_missing_overview(self):
+        """Speichert den aktuellen SPH-Abgleich dauerhaft auf Platte (pro Periode)."""
+        try:
+            cache_path = self._get_sph_cache_path()
+            self.path_manager.ensure_directory(cache_path.parent)
+            payload = {"periods": {}}
+            if cache_path.exists():
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    if isinstance(existing, dict) and isinstance(existing.get("periods"), dict):
+                        payload["periods"] = existing["periods"]
+                except Exception:
+                    payload = {"periods": {}}
+
+            payload["periods"][self._get_active_period_key()] = self.sph_missing_overview
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logging.info(
+                f"SPH-Abgleich gespeichert ({len(self.sph_missing_overview)} Klassen)."
+            )
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern des SPH-Abgleich-Caches: {e}")
 
     def show_login_window(self):
         """Erlaubt das Ändern der Zugangsdaten"""
@@ -2474,7 +2850,9 @@ class KopfnotenGUI:
 
     def run_sph_import(self):
         """Führt den SPH-Import Prozess aus"""
-        self.sph_missing_overview = {}
+        if not self._confirm_period_before_import("SPH-Import"):
+            self.status_manager.set_status("SPH-Import abgebrochen")
+            return
         # Credentials from Manager
         if not self.credentials_manager.credentials:
              messagebox.showerror("Fehler", "Nicht eingeloggt. Bitte melden Sie sich zuerst an.")
@@ -2499,6 +2877,8 @@ class KopfnotenGUI:
 
         # Speichern (Nur Config, nicht user/pw da jetzt secured)
         self.save_sph_config()
+        self.log_to_import("SPH-Import gestartet...")
+        self.status_manager.set_status("SPH-Import gestartet...", True)
 
         import threading
         t = threading.Thread(target=self._sph_worker, args=(school, user, pw, tasks))
@@ -2511,6 +2891,7 @@ class KopfnotenGUI:
             downloader = SPHDownloader(logger=logging.getLogger("sph"))
             
             # Login
+            self.queue_ui(self.log_to_import, "SPH: Login läuft...")
             self.queue_ui(self.status_manager.set_status, "SPH: Login...")
             downloader.login(school, user, pw)
             
@@ -2520,13 +2901,15 @@ class KopfnotenGUI:
 
             # 1) Primär: Autoerkennung (ohne manuelle Vorgabe)
             self.queue_ui(self.status_manager.set_status, "Autoerkenne Klassen aus SPH...")
-            downloaded_files, _auto_tasks = self._auto_detect_and_download_classes(
+            downloaded_files, auto_tasks = self._auto_detect_and_download_classes(
                 downloader, output_dir
             )
+            manual_fallback_used = False
 
             # 2) Backup-Fallback: manuelle Angaben nutzen, falls Autoerkennung nichts gefunden hat
             if not downloaded_files:
                 if tasks:
+                    manual_fallback_used = True
                     self.queue_ui(
                         self.status_manager.set_status,
                         "Autoerkennung ohne Treffer – nutze manuelle Klassenangaben (Backup)...",
@@ -2542,11 +2925,26 @@ class KopfnotenGUI:
                     )
                     self.queue_ui(self.status_manager.set_status, "SPH Import ohne Ergebnis")
                     return
+
+            auto_summary = ", ".join([f"J{int(jg)}={cnt}" for jg, cnt in auto_tasks]) if auto_tasks else "keine Treffer"
+            backup_summary = ", ".join([f"J{int(jg)}={cnt}" for jg, cnt in tasks]) if tasks else "nicht konfiguriert"
+            self.queue_ui(self.log_to_import, f"Autoerkennung: {auto_summary}")
+            if manual_fallback_used:
+                self.queue_ui(self.log_to_import, f"Backup-Fallback aktiv: {backup_summary}")
+            else:
+                self.queue_ui(self.log_to_import, "Backup-Fallback nicht benötigt.")
             
             # Import Trigger
             if downloaded_files:
                 self.queue_ui(self.status_manager.set_status, f"Importiere {len(downloaded_files)} Dateien...")
-                self.queue_ui(self._process_downloaded_files, downloaded_files, (school, user, pw))
+                run_meta = {
+                    "auto_summary": auto_summary,
+                    "backup_summary": backup_summary,
+                    "manual_fallback_used": manual_fallback_used,
+                    "downloaded_count": len(downloaded_files),
+                }
+                # Direkt im Worker aufrufen: _process_downloaded_files verarbeitet UI-Ausgaben selbst per queue_ui
+                self._process_downloaded_files(downloaded_files, (school, user, pw), run_meta)
             else:
                 self.queue_ui(messagebox.showwarning, "Ergebnis", "Keine Dateien erfolgreich geladen.")
 
@@ -2554,78 +2952,122 @@ class KopfnotenGUI:
             self.queue_ui(messagebox.showerror, "SPH Fehler", f"{e}")
             self.queue_ui(self.status_manager.set_status, "Fehler bei SPH Import")
 
-    def _process_downloaded_files(self, file_paths, sph_credentials=None):
+    def _process_downloaded_files(self, file_paths, sph_credentials=None, run_meta=None):
         """Verarbeitet heruntergeladene Dateien"""
+        if threading.current_thread() == threading.main_thread():
+            threading.Thread(
+                target=self._process_downloaded_files,
+                args=(file_paths, sph_credentials, run_meta),
+                daemon=True,
+            ).start()
+            return
         try:
             self.path_manager.ensure_directory(self.db_path.parent)
             
             # Use KopfnotenImporter as context manager
             # Assuming KopfnotenImporter is available (it is in the same file)
-            with KopfnotenImporter(str(self.db_path)) as importer:
+            school_year, term = self._get_active_period()
+            with KopfnotenImporter(str(self.db_path), school_year=school_year, term=term) as importer:
                 count = 0
                 failed = []
-                for fp in file_paths:
+                total = len(file_paths)
+                for idx, fp in enumerate(file_paths, start=1):
                     try:
+                        self.queue_ui(
+                            self.status_manager.set_status,
+                            f"SPH-Import: {idx}/{total} - {Path(fp).name}",
+                            True,
+                        )
+                        self.queue_ui(self.log_to_import, f"Importiere Klasse: {Path(fp).name}")
                         importer.import_excel_file(str(fp))
                         count += 1
+                        self.queue_ui(self.log_to_import, f"✅ Erfolgreich: {Path(fp).name}")
                     except Exception as e:
                         failed.append((Path(fp).name, str(e)))
+                        self.queue_ui(self.log_to_import, f"❌ Fehler bei {Path(fp).name}: {e}")
                         logging.getLogger("importer").error(
                             f"Fehler beim Import von {Path(fp).name}: {e}"
                         )
                 # Nach Import einmal Artefakt-/Namensbereinigung ausführen
                 importer._clean_existing_subjects()
                 
-            self.refresh_all_data()
+            self.queue_ui(self.refresh_all_data)
             # SPH-Abgleich NACH abgeschlossenem Import laden
             if sph_credentials:
                 school, user, pw = sph_credentials
-                self.status_manager.set_status("SPH-Abgleich wird nach Import aktualisiert...")
-                import threading
+                self.queue_ui(self.status_manager.set_status, "SPH-Abgleich wird nach Import aktualisiert...")
                 threading.Thread(
                     target=self._sph_post_import_sync_worker,
                     args=(school, user, pw),
                     daemon=True
                 ).start()
 
+            summary_lines = []
+            if run_meta:
+                summary_lines.append(f"Autoerkennung: {run_meta.get('auto_summary', '-')}")
+                summary_lines.append(
+                    "Backup-Fallback: "
+                    + ("verwendet" if run_meta.get("manual_fallback_used") else "nicht benötigt")
+                )
+                if run_meta.get("manual_fallback_used"):
+                    summary_lines.append(f"Backup-Konfiguration: {run_meta.get('backup_summary', '-')}")
+            summary_text = ("\n\n" + "\n".join(summary_lines)) if summary_lines else ""
+
             if failed:
                 details = "\n".join([f"- {name}: {err}" for name, err in failed[:10]])
                 more = ""
                 if len(failed) > 10:
                     more = f"\n... und {len(failed) - 10} weitere Fehler."
-                messagebox.showwarning(
+                self.queue_ui(
+                    messagebox.showwarning,
                     "SPH Import teilweise erfolgreich",
                     f"{count} Klassen erfolgreich importiert.\n"
                     f"{len(failed)} Klassen konnten nicht importiert werden.\n\n"
-                    f"{details}{more}"
+                    f"{details}{more}{summary_text}"
                 )
             else:
-                messagebox.showinfo("SPH Import", f"{count} Klassen erfolgreich importiert.")
+                self.queue_ui(
+                    messagebox.showinfo,
+                    "SPH Import",
+                    f"{count} Klassen erfolgreich importiert.{summary_text}"
+                )
+
+            if summary_lines:
+                self.queue_ui(self.log_to_import, "Abschluss: " + " | ".join(summary_lines))
+                self.queue_ui(
+                    self.status_manager.set_status,
+                    f"SPH-Import abgeschlossen (Auto: {run_meta.get('auto_summary', '-')}; "
+                    f"Fallback: {'ja' if run_meta.get('manual_fallback_used') else 'nein'})"
+                )
         except Exception as e:
-            messagebox.showerror("Import Fehler", f"{e}")
+            self.queue_ui(messagebox.showerror, "Import Fehler", f"{e}")
 
     def _download_manual_tasks(self, downloader, output_dir: Path, tasks: List[Tuple[str, int]]) -> List[Path]:
         """Lädt Klassen anhand manueller Konfiguration (Backup-Pfad)."""
         downloaded_files: List[Path] = []
-        letters = "abcdefghijklmnopqrstuvwxyz"
+        letters = CLASS_SUFFIX_LETTERS
         for jg, count in tasks:
-            for i in range(count):
+            for i in range(min(count, MAX_CLASSES_PER_JAHRGANG)):
                 suffix = letters[i]
                 class_name = f"{jg}{suffix}"
                 self.queue_ui(self.status_manager.set_status, f"Lade Klasse {class_name} (manuell)...")
+                self.queue_ui(self.log_to_import, f"Lade Klasse {class_name} (manuell)...")
                 file_path = downloader.download_class_list(class_name, jg, output_dir)
                 if file_path:
                     downloaded_files.append(file_path)
+                    self.queue_ui(self.log_to_import, f"✅ Download ok: {class_name}")
+                else:
+                    self.queue_ui(self.log_to_import, f"⚠️ Kein Download: {class_name}")
         return downloaded_files
 
     def _auto_detect_and_download_classes(self, downloader, output_dir: Path) -> Tuple[List[Path], List[Tuple[str, int]]]:
         """
-        Erkennt Klassen pro Jahrgang automatisch durch sequenzielles Testen (05a, 05b, ...).
+        Erkennt Klassen pro Jahrgang automatisch durch sequenzielles Testen (05a … 05i).
         Stoppt je Jahrgang nach 2 Fehlversuchen in Folge nach erstem Treffer.
         """
         downloaded_files: List[Path] = []
         detected_tasks: List[Tuple[str, int]] = []
-        letters = "abcdefghijklmnopqrstuvwxyz"
+        letters = CLASS_SUFFIX_LETTERS
         years = sorted(self.spinboxes.keys()) if hasattr(self, "spinboxes") else [5, 6, 7, 8, 9, 10]
 
         for year in years:
@@ -2633,18 +3075,20 @@ class KopfnotenGUI:
             success_count = 0
             fail_streak = 0
 
-            # Sicherheitsgrenze je Jahrgang (max. 12 Klassen)
-            for i in range(12):
+            for i in range(MAX_CLASSES_PER_JAHRGANG):
                 class_name = f"{jg}{letters[i]}"
                 self.queue_ui(self.status_manager.set_status, f"Autocheck Klasse {class_name}...")
+                self.queue_ui(self.log_to_import, f"Autocheck Klasse {class_name}...")
                 file_path = downloader.download_class_list(class_name, jg, output_dir)
 
                 if file_path:
                     downloaded_files.append(file_path)
                     success_count += 1
                     fail_streak = 0
+                    self.queue_ui(self.log_to_import, f"✅ Download ok: {class_name}")
                 else:
                     fail_streak += 1
+                    self.queue_ui(self.log_to_import, f"— Nicht gefunden: {class_name}")
                     if success_count == 0 and fail_streak >= 1:
                         break
                     if success_count > 0 and fail_streak >= 2:
@@ -2663,7 +3107,9 @@ class KopfnotenGUI:
             downloader.login(school, user, pw)
             overview = downloader.fetch_missing_submissions_overview()
             self.sph_missing_overview = overview
+            self.save_sph_missing_overview()
             self.queue_ui(self.refresh_analysis_data)
+            self.queue_ui(self.refresh_insights_data)
             self.queue_ui(
                 self.status_manager.set_status,
                 f"SPH-Abgleich aktualisiert ({len(overview)} Klassen)."
@@ -2682,17 +3128,25 @@ class KopfnotenGUI:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Datei", menu=file_menu)
         file_menu.add_command(label="Datenbank öffnen", command=self.open_database)
+        file_menu.add_command(label="Datenbank importieren...", command=self.import_database_file)
+        file_menu.add_command(label="Datenbank exportieren...", command=self.export_database_file)
         file_menu.add_command(label="Datenbank-Info", command=self.show_database_info)
         file_menu.add_command(label="Datenbank sichern", command=self.backup_database)
+        file_menu.add_separator()
+        file_menu.add_command(
+            label="Backup-Klassenangaben...",
+            command=self.show_backup_class_config,
+        )
         file_menu.add_separator()
         file_menu.add_command(label="Beenden", command=self.root.quit)
         # Werkzeuge-Menü
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Werkzeuge", menu=tools_menu)
-        tools_menu.add_command(
-            label="Template-Designer",
-            command=self.template_designer.create_template_designer_window,
-        )
+        if TEMPLATE_MANAGER_ENABLED:
+            tools_menu.add_command(
+                label="Template-Designer",
+                command=self.template_designer.create_template_designer_window,
+            )
         tools_menu.add_command(label="Logs anzeigen", command=self.show_logs)
         tools_menu.add_separator()
         tools_menu.add_command(
@@ -2702,89 +3156,152 @@ class KopfnotenGUI:
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Hilfe", menu=help_menu)
         help_menu.add_command(label="Über", command=self.show_about)
-        help_menu.add_command(label="Linux-Hilfe", command=self.show_linux_help)
 
     def create_import_tab(self):
         """Erstellt Import-Tab"""
         import_frame = ttk.Frame(self.notebook)
         self.notebook.add(import_frame, text="📥 Import")
-        # Header
-        header_frame = ttk.LabelFrame(import_frame, text="1. Excel-Dateien importieren (Lokal)")
-        header_frame.pack(fill=tk.X, padx=10, pady=5)
-        # Buttons
-        button_frame = ttk.Frame(header_frame)
-        button_frame.pack(fill=tk.X, padx=5, pady=5)
+        import_frame.columnconfigure(0, weight=1)
+        import_frame.rowconfigure(0, weight=3)
+        import_frame.rowconfigure(1, weight=2)
+        import_frame.rowconfigure(2, weight=0)
+
+        # --- 1. SPH (oben, präsent) ---
+        sph_frame = ttk.LabelFrame(import_frame, text="1. Import aus Schulportal Hessen (SPH)")
+        sph_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
+
+        sph_left = ttk.Frame(sph_frame)
+        sph_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        sph_right = ttk.Frame(sph_frame)
+        sph_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self.sph_login_container = ttk.Frame(sph_left)
+        self.sph_login_container.pack(fill=tk.X, padx=5, pady=5)
+        self.create_widgets_sph_section()
+
+        ttk.Label(
+            sph_right,
+            text="Automatische Klassenerkennung ist aktiv.",
+            font=("Segoe UI", 10, "bold"),
+            foreground="#15803d",
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            sph_right,
+            text="Manuelle Klassenanzahlen nur als Backup – einstellbar unter Datei → Backup-Klassenangaben.",
+            foreground="#555",
+            wraplength=420,
+        ).pack(anchor=tk.W, pady=(4, 12))
+
+        self.sph_import_btn = tk.Button(
+            sph_right,
+            text="SPH Download & Import",
+            command=self.run_sph_import,
+            font=("Segoe UI", 13, "bold"),
+            bg="#2563eb",
+            fg="white",
+            activebackground="#1d4ed8",
+            activeforeground="white",
+            relief=tk.FLAT,
+            cursor="hand2",
+            padx=16,
+            pady=12,
+        )
+        self.sph_import_btn.pack(fill=tk.X, ipady=6)
+        self.sph_status_label = ttk.Label(sph_right, text="-", foreground="#555")
+        self.sph_status_label.pack(anchor=tk.W, pady=(8, 0))
+
+        self._create_backup_class_config_dialog()
+
+        # --- Import-Log (Mitte, für SPH und lokalen Import) ---
+        log_frame = ttk.LabelFrame(import_frame, text="Import-Log")
+        log_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        self.import_log = scrolledtext.ScrolledText(
+            log_frame, height=10, state=tk.DISABLED, font=("Consolas", 9)
+        )
+        self.import_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # --- 2. Manueller Import (unten, kompakt) ---
+        manual_frame = ttk.LabelFrame(import_frame, text="2. Excel-Dateien importieren (Lokal)")
+        manual_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 10))
+
+        button_frame = ttk.Frame(manual_frame)
+        button_frame.pack(fill=tk.X, padx=5, pady=4)
         ttk.Button(
             button_frame, text="Excel-Dateien auswählen", command=self.select_excel_files
-        ).pack(side=tk.LEFT, padx=5)
+        ).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(
             button_frame, text="Alle importieren", command=self.import_all_files
-        ).pack(side=tk.LEFT, padx=(0, 5))
+        ).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(
             button_frame, text="Auswahl löschen", command=self.clear_import_selection
         ).pack(side=tk.LEFT)
         ttk.Button(
             button_frame, text="Datenbank komplett löschen", command=self.delete_database
-        ).pack(side=tk.RIGHT, padx=5) # Rechtsbündig als "Gefahr")
-        # Liste
-        list_frame = ttk.LabelFrame(import_frame, text="Ausgewählte Dateien")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        listbox_frame = ttk.Frame(list_frame)
-        listbox_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.import_listbox = tk.Listbox(listbox_frame, selectmode=tk.EXTENDED)
+        ).pack(side=tk.RIGHT)
+
+        list_frame = ttk.Frame(manual_frame)
+        list_frame.pack(fill=tk.X, padx=5, pady=(0, 6))
+        self.import_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED, height=4, font=("Segoe UI", 9))
         scrollbar_import = ttk.Scrollbar(
-            listbox_frame, orient=tk.VERTICAL, command=self.import_listbox.yview
+            list_frame, orient=tk.VERTICAL, command=self.import_listbox.yview
         )
         self.import_listbox.config(yscrollcommand=scrollbar_import.set)
-        self.import_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.import_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
         scrollbar_import.pack(side=tk.RIGHT, fill=tk.Y)
-        # Import-Log
-        log_frame = ttk.LabelFrame(import_frame, text="Import-Log")
-        log_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.import_log = scrolledtext.ScrolledText(
-            log_frame, height=8, state=tk.DISABLED
-        )
-        self.import_log.pack(fill=tk.X, padx=5, pady=5)
-        
-        # --- SPH SECTION MERGED ---
-        sph_frame = ttk.LabelFrame(import_frame, text="2. Import aus Schulportal Hessen (SPH)")
-        sph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Split SPH frame
-        sph_left = ttk.Frame(sph_frame)
-        sph_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        sph_right = ttk.Frame(sph_frame)
-        sph_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # -- Links: Credentials & Search --
-    
-        # ID & Login Grid
-        self.sph_login_container = ttk.Frame(sph_left)
-        self.sph_login_container.pack(fill=tk.X, padx=5, pady=5)
-        self.create_widgets_sph_section()
 
-
-        # -- Rechts: Konfiguration --
-        ttk.Label(sph_right, text="Klassen-Konfiguration (Züge):", font=("Arial", 9, "bold")).pack(anchor=tk.W)
-        
-        config_grid = ttk.Frame(sph_right)
-        config_grid.pack(fill=tk.BOTH, expand=True)
-        
+    def _create_backup_class_config_dialog(self):
+        """Erstellt den Backup-Klassendialog (ausgeblendet, öffnen über Datei-Menü)."""
         self.spinboxes = {}
+        self._backup_cfg_dialog = tk.Toplevel(self.root)
+        self._backup_cfg_dialog.withdraw()
+        self._backup_cfg_dialog.title("Backup: Klassen-Konfiguration (Züge)")
+        self._backup_cfg_dialog.transient(self.root)
+        self._backup_cfg_dialog.resizable(False, False)
+
+        ttk.Label(
+            self._backup_cfg_dialog,
+            text="Fallback, wenn die Autoerkennung keine Klassen findet.\n"
+                 "Anzahl Klassen pro Jahrgang (0 = nicht verwenden).",
+            wraplength=360,
+            foreground="#555",
+        ).pack(anchor=tk.W, padx=12, pady=(12, 8))
+
+        config_grid = ttk.Frame(self._backup_cfg_dialog)
+        config_grid.pack(fill=tk.X, padx=12, pady=(0, 8))
+
         years = [5, 6, 7, 8, 9, 10]
         for i, year in enumerate(years):
             r = i // 2
             c = (i % 2) * 2
             ttk.Label(config_grid, text=f"J{year}:").grid(row=r, column=c, sticky=tk.W, padx=2, pady=2)
-            spin = ttk.Spinbox(config_grid, from_=0, to=10, width=3)
+            spin = ttk.Spinbox(config_grid, from_=0, to=MAX_CLASSES_PER_JAHRGANG, width=4)
             spin.set(3)
-            spin.grid(row=r, column=c+1, sticky=tk.W, padx=2, pady=2)
+            spin.grid(row=r, column=c + 1, sticky=tk.W, padx=(2, 16), pady=2)
             self.spinboxes[year] = spin
 
-        # Action Button
-        ttk.Button(sph_right, text="🚀 SPH Download & Import", command=self.run_sph_import).pack(fill=tk.X, pady=10)
-        self.sph_status_label = ttk.Label(sph_right, text="-")
-        self.sph_status_label.pack()
+        btn_frame = ttk.Frame(self._backup_cfg_dialog)
+        btn_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+        ttk.Button(btn_frame, text="Speichern & Schließen", command=self._close_backup_class_config).pack(
+            side=tk.RIGHT
+        )
+        ttk.Button(btn_frame, text="Abbrechen", command=self._backup_cfg_dialog.withdraw).pack(
+            side=tk.RIGHT, padx=(0, 8)
+        )
+        self._backup_cfg_dialog.protocol("WM_DELETE_WINDOW", self._close_backup_class_config)
+
+    def show_backup_class_config(self):
+        """Öffnet den Dialog für manuelle Backup-Klassenangaben."""
+        if not hasattr(self, "_backup_cfg_dialog"):
+            self._create_backup_class_config_dialog()
+        self._backup_cfg_dialog.deiconify()
+        self._backup_cfg_dialog.lift()
+        self._backup_cfg_dialog.focus_force()
+
+    def _close_backup_class_config(self):
+        """Speichert Backup-Klassenangaben und schließt den Dialog."""
+        self.save_sph_config()
+        if hasattr(self, "_backup_cfg_dialog"):
+            self._backup_cfg_dialog.withdraw()
 
     # Old create_sph_tab removed or ignored (can remove entire method if desired, but replacing logic here)
     # def create_sph_tab(self): ... -> DELETED/IGNORED content below
@@ -2793,7 +3310,34 @@ class KopfnotenGUI:
     def create_analysis_tab(self):
         """Erstellt Analyse-Tab"""
         analysis_frame = ttk.Frame(self.notebook)
-        self.notebook.add(analysis_frame, text="🔍 Analyse")
+        self.notebook.add(analysis_frame, text="🗄 Datenbank")
+        period_frame = ttk.LabelFrame(analysis_frame, text="Aktive Periode")
+        period_frame.pack(fill=tk.X, padx=10, pady=(8, 5))
+        ttk.Label(period_frame, text="Schuljahr:").pack(side=tk.LEFT, padx=(6, 4), pady=6)
+        self.school_year_combo = ttk.Combobox(
+            period_frame,
+            textvariable=self.current_school_year_var,
+            width=12,
+            state="normal",
+            values=self._suggest_school_years(),
+        )
+        self.school_year_combo.pack(side=tk.LEFT, padx=(0, 12), pady=6)
+        self.school_year_combo.bind("<<ComboboxSelected>>", self.on_period_changed)
+        self.school_year_combo.bind("<FocusOut>", self.on_period_changed)
+        ttk.Label(period_frame, text="Halbjahr:").pack(side=tk.LEFT, padx=(0, 4), pady=6)
+        self.term_combo = ttk.Combobox(
+            period_frame,
+            textvariable=self.current_term_var,
+            width=5,
+            state="readonly",
+            values=[1, 2],
+        )
+        self.term_combo.pack(side=tk.LEFT, padx=(0, 12), pady=6)
+        self.term_combo.bind("<<ComboboxSelected>>", self.on_period_changed)
+        self.period_info_label = ttk.Label(period_frame, foreground="#555")
+        self.period_info_label.pack(side=tk.LEFT, padx=(6, 0), pady=6)
+        self._refresh_period_label()
+
         # Filter
         filter_frame = ttk.LabelFrame(analysis_frame, text="Filter und Suche")
         filter_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -2864,7 +3408,10 @@ class KopfnotenGUI:
             edit_frame, text="Noten bearbeiten", command=self.edit_selected_grade
         ).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(
-            edit_frame, text="Schüler löschen", command=self.delete_selected_student
+            edit_frame, text="Lernende deaktivieren", command=self.deactivate_selected_student
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            edit_frame, text="Deaktivierte verwalten", command=self.manage_inactive_students
         ).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(
             edit_frame, text="Daten aktualisieren", command=self.refresh_analysis_data
@@ -2879,10 +3426,890 @@ class KopfnotenGUI:
             edit_frame, text="Fehlliste exportieren", command=self.export_missing_list
         ).pack(side=tk.RIGHT, padx=5)
 
+    def create_insights_tab(self):
+        """Erstellt den Analyse-Tab mit Kennzahlen, Rankings und Trends."""
+        insights_frame = ttk.Frame(self.notebook)
+        self.notebook.add(insights_frame, text="📊 Analyse")
+
+        toolbar = ttk.Frame(insights_frame)
+        toolbar.pack(fill=tk.X, padx=10, pady=(8, 4))
+        ttk.Button(
+            toolbar, text="Analyse aktualisieren", command=self.refresh_insights_data
+        ).pack(side=tk.LEFT)
+        self.insights_period_label = ttk.Label(toolbar, foreground="#555")
+        self.insights_period_label.pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(
+            toolbar,
+            text="Basisperiode = Auswahl im Tab „Datenbank“ · ohne deaktivierte Lernende",
+            foreground="#666",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+
+        compare_frame = ttk.LabelFrame(
+            insights_frame,
+            text="Vergleichsperioden (Strg/Klick für Mehrfachauswahl)",
+        )
+        compare_frame.pack(fill=tk.X, padx=10, pady=(0, 6))
+        compare_inner = ttk.Frame(compare_frame)
+        compare_inner.pack(fill=tk.X, padx=8, pady=6)
+        self.insights_compare_listbox = tk.Listbox(
+            compare_inner,
+            selectmode=tk.EXTENDED,
+            height=5,
+            exportselection=False,
+            font=("Segoe UI", 10),
+        )
+        compare_scroll = ttk.Scrollbar(
+            compare_inner, orient=tk.VERTICAL, command=self.insights_compare_listbox.yview
+        )
+        self.insights_compare_listbox.configure(yscrollcommand=compare_scroll.set)
+        self.insights_compare_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        compare_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._insights_compare_period_map: List[Tuple[str, int]] = []
+
+        kpi_frame = ttk.Frame(insights_frame)
+        kpi_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
+        self.insights_kpi_vars = {}
+        self._create_kpi_card(kpi_frame, "students", "Lernende", "0")
+        self._create_kpi_card(kpi_frame, "overall_avg", "Gesamtschnitt", "-")
+        self._create_kpi_card(kpi_frame, "completion", "Vollständigkeit", "-")
+        self._create_kpi_card(kpi_frame, "classes", "Klassen", "0")
+
+        self.insights_text_sections = {}
+        self.insights_tables = {}
+        section_notebook = ttk.Notebook(insights_frame)
+        section_notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        section_defs = [
+            ("overview", "Überblick", "text"),
+            ("classes", "Klassen", "table"),
+            ("years", "Jahrgänge", "table"),
+            ("subjects", "Fächer & Ranking", "table"),
+            ("top", "Top Lernende", "custom_top"),
+            ("trends", "Entwicklung", "text"),
+        ]
+        for key, label, section_type in section_defs:
+            frame = ttk.Frame(section_notebook)
+            section_notebook.add(frame, text=label)
+            if section_type == "text":
+                text = scrolledtext.ScrolledText(
+                    frame,
+                    state=tk.DISABLED,
+                    wrap=tk.WORD,
+                    font=("Segoe UI", 10),
+                    padx=12,
+                    pady=10,
+                )
+                text.pack(fill=tk.BOTH, expand=True)
+                self.insights_text_sections[key] = text
+            elif key == "classes":
+                self.insights_tables[key] = self._create_insights_table(
+                    frame,
+                    columns=["Klasse", "AV", "SV", "Gesamt", "Vollst. %", "Lernende"],
+                    widths=[120, 90, 90, 90, 110, 90],
+                    numeric_columns={"AV", "SV", "Gesamt", "Vollst. %", "Lernende"},
+                )
+            elif key == "years":
+                self.insights_tables[key] = self._create_insights_table(
+                    frame,
+                    columns=["Jahrgang", "AV", "SV", "Gesamt", "Vollst. %", "Lernende"],
+                    widths=[120, 90, 90, 90, 110, 90],
+                    numeric_columns={"AV", "SV", "Gesamt", "Vollst. %", "Lernende"},
+                )
+            elif key == "subjects":
+                self.insights_tables[key] = self._create_insights_table(
+                    frame,
+                    columns=["Rang", "Fach", "AV", "SV", "Gesamt", "Streuung", "Noten"],
+                    widths=[70, 220, 90, 90, 90, 100, 80],
+                    numeric_columns={"Rang", "AV", "SV", "Gesamt", "Streuung", "Noten"},
+                )
+            elif key == "top":
+                self.insights_top_tables = self._create_top_section_widgets(frame)
+
+        self.refresh_insights_data()
+
+    def _create_kpi_card(self, parent, key: str, title: str, initial: str):
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(10, 8))
+        card.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor=tk.W)
+        value_var = tk.StringVar(value=initial)
+        ttk.Label(card, textvariable=value_var, style="CardValue.TLabel").pack(anchor=tk.W, pady=(3, 0))
+        self.insights_kpi_vars[key] = value_var
+
+    def _create_insights_table(
+        self,
+        parent,
+        columns: List[str],
+        widths: List[int],
+        numeric_columns: Optional[set] = None,
+        stretch_columns: Optional[set] = None,
+        tree_height: int = 18,
+    ):
+        numeric_columns = numeric_columns or set()
+        stretch_columns = stretch_columns or set()
+        wrapper = ttk.Frame(parent)
+        wrapper.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        tree = ttk.Treeview(wrapper, columns=columns, show="headings", height=tree_height)
+        v_scroll = ttk.Scrollbar(wrapper, orient=tk.VERTICAL, command=tree.yview)
+        h_scroll = ttk.Scrollbar(wrapper, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        tree.tag_configure("row_even", background="#f8fafc")
+        tree.tag_configure("row_odd", background="#ffffff")
+        for col, width in zip(columns, widths):
+            is_numeric = col in numeric_columns
+            anchor = tk.E if is_numeric else tk.W
+            tree.heading(col, text=col, anchor=anchor)
+            tree.column(col, width=width, anchor=anchor, stretch=(col in stretch_columns))
+        tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        wrapper.grid_rowconfigure(0, weight=1)
+        wrapper.grid_columnconfigure(0, weight=1)
+        return tree
+
+    def _create_top_section_widgets(self, parent):
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        top_cols = ["Rang", "Name", "Klasse", "Jg", "AV Ø", "SV Ø", "Gesamt Ø", "Fächer"]
+        top_widths = [55, 260, 80, 45, 70, 70, 80, 60]
+        top_numeric = {"Jg", "AV Ø", "SV Ø", "Gesamt Ø", "Fächer"}
+
+        school_tab = ttk.Frame(notebook)
+        notebook.add(school_tab, text="Top 10 – Schule")
+        school_tree = self._create_insights_table(
+            school_tab,
+            columns=top_cols,
+            widths=top_widths,
+            numeric_columns=top_numeric,
+            stretch_columns={"Name"},
+            tree_height=12,
+        )
+
+        year_tab = ttk.Frame(notebook)
+        notebook.add(year_tab, text="Top 3 – je Jahrgang")
+        year_tree = self._create_insights_table(
+            year_tab,
+            columns=["Jahrgang", "Platz", "Name", "Klasse", "AV Ø", "SV Ø", "Gesamt Ø", "Fächer"],
+            widths=[70, 55, 260, 80, 70, 70, 80, 60],
+            numeric_columns={"AV Ø", "SV Ø", "Gesamt Ø", "Fächer"},
+            stretch_columns={"Name"},
+            tree_height=22,
+        )
+
+        class_tab = ttk.Frame(notebook)
+        notebook.add(class_tab, text="Klassenbeste – je Klasse")
+        class_tree = self._create_insights_table(
+            class_tab,
+            columns=["Klasse", "Name", "Jg", "AV Ø", "SV Ø", "Gesamt Ø", "Fächer"],
+            widths=[80, 260, 45, 70, 70, 80, 60],
+            numeric_columns={"Jg", "AV Ø", "SV Ø", "Gesamt Ø", "Fächer"},
+            stretch_columns={"Name", "Klasse"},
+            tree_height=22,
+        )
+        return {
+            "school": school_tree,
+            "year": year_tree,
+            "class": class_tree,
+        }
+
+    def _rank_medal(self, rank: int) -> str:
+        """Platz 1–3 als Medaille, sonst Zahl."""
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        try:
+            rank_int = int(rank)
+        except (TypeError, ValueError):
+            return str(rank)
+        return medals.get(rank_int, str(rank_int))
+
+    def _top_student_grade_values(self, student: Dict[str, Any]) -> Tuple[str, str, str, int]:
+        """AV-, SV- und Gesamtwerte für Top-Tabellen."""
+        return (
+            self._fmt_avg(student.get("av_avg")),
+            self._fmt_avg(student.get("sv_avg")),
+            self._fmt_avg(student.get("gesamt_avg")),
+            int(student.get("subjects_graded") or 0),
+        )
+
+    def _safe_avg(self, values: List[float]) -> Optional[float]:
+        vals = [float(v) for v in values if v is not None]
+        if not vals:
+            return None
+        return sum(vals) / len(vals)
+
+    def _fmt_avg(self, value: Optional[float]) -> str:
+        return "-" if value is None else f"{value:.2f}"
+
+    def _extract_jahrgang_from_klasse(self, klasse: str) -> int:
+        match = re.search(r"(\d+)", str(klasse or ""))
+        return int(match.group(1)) if match else 0
+
+    def _class_sort_key(self, klasse: Any) -> Tuple[int, str]:
+        raw = str(klasse or "").strip()
+        m = re.match(r"^(\d+)\s*([A-Za-z].*)?$", raw)
+        if m:
+            num = int(m.group(1))
+            suffix = (m.group(2) or "").lower()
+            return (num, suffix)
+        m2 = re.match(r"^(\d+)", raw)
+        if m2:
+            return (int(m2.group(1)), raw.lower())
+        return (999, raw.lower())
+
+    def _period_sort_key(self, school_year: str, term: int) -> Tuple[int, int]:
+        try:
+            start_year = int(str(school_year).split("/")[0])
+        except Exception:
+            start_year = 0
+        return (start_year, int(term))
+
+    def _period_label(self, school_year: str, term: int) -> str:
+        return f"{school_year} · HJ {term}"
+
+    def _get_available_periods(self) -> List[Tuple[str, int]]:
+        if not self.db_path.exists():
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT n.schuljahr, n.halbjahr
+                FROM noten n
+                JOIN schueler s ON n.schueler_id = s.schueler_id
+                WHERE n.schuljahr IS NOT NULL
+                  AND n.halbjahr IS NOT NULL
+                  AND COALESCE(s.is_active, 1) = 1
+                """
+            ).fetchall()
+        periods = []
+        for sy, term in rows:
+            try:
+                periods.append((str(sy), int(term)))
+            except Exception:
+                continue
+        periods.sort(key=lambda p: self._period_sort_key(p[0], p[1]))
+        return periods
+
+    def _sync_insights_compare_periods(self, current_school_year: str, current_term: int):
+        """Befüllt die Vergleichsperioden-Liste (ohne aktive Basisperiode)."""
+        if not hasattr(self, "insights_compare_listbox"):
+            return
+        previous_selection = set(self._get_selected_compare_periods())
+        available = self._get_available_periods()
+        self.insights_compare_listbox.delete(0, tk.END)
+        self._insights_compare_period_map = []
+
+        for sy, term in available:
+            if sy == current_school_year and int(term) == int(current_term):
+                continue
+            self._insights_compare_period_map.append((sy, term))
+            self.insights_compare_listbox.insert(tk.END, self._period_label(sy, term))
+
+        if not self._insights_compare_period_map:
+            return
+
+        selected_indices = []
+        if previous_selection:
+            for idx, period in enumerate(self._insights_compare_period_map):
+                if period in previous_selection:
+                    selected_indices.append(idx)
+        if not selected_indices:
+            prev_period = self._find_previous_period(current_school_year, current_term)
+            if prev_period and prev_period in self._insights_compare_period_map:
+                selected_indices = [self._insights_compare_period_map.index(prev_period)]
+
+        for idx in selected_indices:
+            self.insights_compare_listbox.selection_set(idx)
+
+    def _get_selected_compare_periods(self) -> List[Tuple[str, int]]:
+        if not hasattr(self, "insights_compare_listbox"):
+            return []
+        return [
+            self._insights_compare_period_map[idx]
+            for idx in self.insights_compare_listbox.curselection()
+            if 0 <= idx < len(self._insights_compare_period_map)
+        ]
+
+    def _find_previous_period(self, school_year: str, term: int) -> Optional[Tuple[str, int]]:
+        periods = self._get_available_periods()
+        current_key = self._period_sort_key(school_year, term)
+        previous = None
+        for sy, t in periods:
+            if self._period_sort_key(sy, t) < current_key:
+                previous = (sy, t)
+        if previous:
+            return previous
+        # Fallback: anderes Halbjahr im selben Schuljahr
+        alt_term = 1 if int(term) == 2 else 2
+        if (school_year, alt_term) in periods:
+            return (school_year, alt_term)
+        return None
+
+    def _collect_analysis_dataset(self, school_year: str, term: int) -> Dict[str, Any]:
+        dataset = {
+            "students": [],
+            "class_stats": {},
+            "year_stats": {},
+            "subject_stats": [],
+            "school": {},
+            "top_by_class": {},
+            "top_by_year": {},
+            "top_school": [],
+            "period": (school_year, term),
+        }
+        if not self.db_path.exists():
+            return dataset
+
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.schueler_id,
+                    s.name,
+                    s.klasse,
+                    s.target_subjects,
+                    n.fach_id,
+                    COALESCE(f.fach_lang, f.fach_kurz, '') AS fach_name,
+                    n.note_av,
+                    n.note_sv,
+                    n.note_av_special,
+                    n.note_sv_special
+                FROM schueler s
+                LEFT JOIN noten n ON s.schueler_id = n.schueler_id
+                    AND n.schuljahr = ?
+                    AND n.halbjahr = ?
+                LEFT JOIN faecher f ON n.fach_id = f.fach_id
+                WHERE COALESCE(s.is_active, 1) = 1
+                ORDER BY s.klasse, s.name
+                """,
+                (school_year, term),
+            ).fetchall()
+
+        student_map = {}
+        subject_map = {}
+        for s_id, name, klasse, target_subjects, fach_id, fach_name, av, sv, av_special, sv_special in rows:
+            if s_id not in student_map:
+                student_map[s_id] = {
+                    "id": s_id,
+                    "name": name,
+                    "klasse": klasse,
+                    "jahrgang": self._extract_jahrgang_from_klasse(klasse),
+                    "target_subjects": target_subjects,
+                    "av_notes": [],
+                    "sv_notes": [],
+                    "combined_notes": [],
+                    "graded_subjects": set(),
+                    "filled_entries": 0,
+                }
+            sm = student_map[s_id]
+            if av is not None:
+                sm["av_notes"].append(float(av))
+                sm["combined_notes"].append(float(av))
+            if av is not None or av_special is not None:
+                sm["filled_entries"] += 1
+            if sv is not None:
+                sm["sv_notes"].append(float(sv))
+                sm["combined_notes"].append(float(sv))
+            if sv is not None or sv_special is not None:
+                sm["filled_entries"] += 1
+            if fach_id and (av is not None or sv is not None or av_special is not None or sv_special is not None):
+                sm["graded_subjects"].add(int(fach_id))
+
+            subject_name = (fach_name or "").strip()
+            if subject_name:
+                if subject_name not in subject_map:
+                    subject_map[subject_name] = {"av_notes": [], "sv_notes": [], "combined_notes": []}
+                if av is not None:
+                    subject_map[subject_name]["av_notes"].append(float(av))
+                    subject_map[subject_name]["combined_notes"].append(float(av))
+                if sv is not None:
+                    subject_map[subject_name]["sv_notes"].append(float(sv))
+                    subject_map[subject_name]["combined_notes"].append(float(sv))
+
+        for sm in student_map.values():
+            av_avg = self._safe_avg(sm["av_notes"])
+            sv_avg = self._safe_avg(sm["sv_notes"])
+            ges_avg = self._safe_avg(sm["combined_notes"])
+            notes_total = sm["filled_entries"]
+            target = sm["target_subjects"] or self.get_default_target_for_grade(sm["jahrgang"])
+            completion_pct = None
+            if target:
+                completion_pct = min(100.0, (notes_total / max(1, target * 2)) * 100.0)
+            dataset["students"].append(
+                {
+                    "id": sm["id"],
+                    "name": sm["name"],
+                    "klasse": sm["klasse"],
+                    "jahrgang": sm["jahrgang"],
+                    "av_avg": av_avg,
+                    "sv_avg": sv_avg,
+                    "gesamt_avg": ges_avg,
+                    "notes_total": notes_total,
+                    "subjects_graded": len(sm["graded_subjects"]),
+                    "completion_pct": completion_pct,
+                }
+            )
+
+        def summarize_group(students: List[Dict[str, Any]]) -> Dict[str, Any]:
+            av_values = [s["av_avg"] for s in students if s["av_avg"] is not None]
+            sv_values = [s["sv_avg"] for s in students if s["sv_avg"] is not None]
+            total_values = [s["gesamt_avg"] for s in students if s["gesamt_avg"] is not None]
+            completion_vals = [s["completion_pct"] for s in students if s["completion_pct"] is not None]
+            return {
+                "count": len(students),
+                "av_avg": self._safe_avg(av_values),
+                "sv_avg": self._safe_avg(sv_values),
+                "gesamt_avg": self._safe_avg(total_values),
+                "completion_pct": self._safe_avg(completion_vals),
+            }
+
+        class_groups = {}
+        year_groups = {}
+        for s in dataset["students"]:
+            class_groups.setdefault(s["klasse"], []).append(s)
+            year_groups.setdefault(s["jahrgang"], []).append(s)
+
+        dataset["class_stats"] = {
+            klasse: summarize_group(students)
+            for klasse, students in sorted(class_groups.items(), key=lambda item: self._class_sort_key(item[0]))
+        }
+        dataset["year_stats"] = {
+            jahrgang: summarize_group(students)
+            for jahrgang, students in sorted(year_groups.items(), key=lambda item: item[0])
+        }
+        dataset["school"] = summarize_group(dataset["students"])
+
+        subject_stats = []
+        for subject_name, vals in subject_map.items():
+            combined = vals["combined_notes"]
+            stddev = statistics.pstdev(combined) if len(combined) >= 2 else 0.0
+            subject_stats.append(
+                {
+                    "subject": subject_name,
+                    "av_avg": self._safe_avg(vals["av_notes"]),
+                    "sv_avg": self._safe_avg(vals["sv_notes"]),
+                    "gesamt_avg": self._safe_avg(combined),
+                    "count": len(combined),
+                    "stddev": stddev,
+                }
+            )
+        subject_stats.sort(
+            key=lambda x: (
+                float("inf") if x["gesamt_avg"] is None else x["gesamt_avg"],
+                x["subject"].lower(),
+            )
+        )
+        dataset["subject_stats"] = subject_stats
+
+        def top_students(students: List[Dict[str, Any]], limit: int = 5, min_subjects: int = 4):
+            valid = [
+                s for s in students
+                if s["gesamt_avg"] is not None and s["subjects_graded"] >= min_subjects
+            ]
+            valid.sort(key=lambda s: (s["gesamt_avg"], -s["notes_total"], s["name"].lower()))
+            return valid[:limit]
+
+        dataset["top_school"] = top_students(dataset["students"], limit=10)
+        dataset["top_by_class"] = {
+            klasse: top_students(students, limit=1, min_subjects=3)
+            for klasse, students in sorted(class_groups.items(), key=lambda item: self._class_sort_key(item[0]))
+        }
+        dataset["top_by_year"] = {
+            jahrgang: top_students(students, limit=3, min_subjects=3)
+            for jahrgang, students in sorted(year_groups.items(), key=lambda item: item[0])
+        }
+
+        return dataset
+
+    def _render_overview_section(
+        self, current: Dict[str, Any], compare_datasets: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        school_year, term = current["period"]
+        school = current["school"]
+        students = current["students"]
+        classes_count = len(current["class_stats"])
+        years_count = len(current["year_stats"])
+        complete_count = sum(1 for s in students if (s["completion_pct"] or 0) >= 99.9)
+        incomplete_count = len(students) - complete_count
+        lines = [
+            f"Periode: {school_year} (HJ {term})",
+            "Hinweis: Deaktivierte Lernende sind in allen Kennzahlen ausgeschlossen.",
+            "",
+            "Gesamtkennzahlen:",
+            f"- Lernende (aktiv): {len(students)}",
+            f"- Klassen: {classes_count}",
+            f"- Jahrgänge: {years_count}",
+            f"- AV-Durchschnitt: {self._fmt_avg(school.get('av_avg'))}",
+            f"- SV-Durchschnitt: {self._fmt_avg(school.get('sv_avg'))}",
+            f"- Gesamtdurchschnitt: {self._fmt_avg(school.get('gesamt_avg'))}",
+            f"- Durchschnittliche Vollständigkeit: {self._fmt_avg(school.get('completion_pct'))}%",
+            f"- Vollständig (>=99.9%): {complete_count}",
+            f"- Unvollständig: {incomplete_count}",
+        ]
+        compare_datasets = compare_datasets or []
+        if compare_datasets:
+            lines.extend(["", "Vergleich zu ausgewählten Perioden:"])
+            for previous in compare_datasets:
+                prev_school = previous["school"]
+                prev_year, prev_term = previous["period"]
+                delta = None
+                if school.get("gesamt_avg") is not None and prev_school.get("gesamt_avg") is not None:
+                    delta = school["gesamt_avg"] - prev_school["gesamt_avg"]
+                student_delta = len(students) - len(previous.get("students", []))
+                lines.extend([
+                    "",
+                    f"→ {prev_year} (HJ {prev_term}):",
+                    f"  Gesamtdurchschnitt: {self._fmt_avg(prev_school.get('gesamt_avg'))} "
+                    f"(Delta {self._fmt_avg(delta)})",
+                    f"  Lernende aktiv: {len(previous.get('students', []))} (Delta {student_delta:+d})",
+                    f"  Vollständigkeit: {self._fmt_avg(prev_school.get('completion_pct'))}%",
+                ])
+        return "\n".join(lines)
+
+    def _render_class_section(self, current: Dict[str, Any]) -> str:
+        lines = ["Klassendurchschnitte (aktive Periode):", ""]
+        ranked = sorted(
+            current["class_stats"].items(),
+            key=lambda item: (float("inf") if item[1]["gesamt_avg"] is None else item[1]["gesamt_avg"], str(item[0])),
+        )
+        for klasse, stats in ranked:
+            lines.append(
+                f"- {klasse}: AV {self._fmt_avg(stats['av_avg'])} | "
+                f"SV {self._fmt_avg(stats['sv_avg'])} | Gesamt {self._fmt_avg(stats['gesamt_avg'])} | "
+                f"Vollständigkeit {self._fmt_avg(stats['completion_pct'])}% | Lernende {stats['count']}"
+            )
+        if len(lines) == 2:
+            lines.append("- Keine Klassendaten")
+        return "\n".join(lines)
+
+    def _render_year_section(self, current: Dict[str, Any]) -> str:
+        lines = ["Jahrgangsdurchschnitte (aktive Periode):", ""]
+        for jahrgang, stats in current["year_stats"].items():
+            lines.append(
+                f"- Jg {jahrgang}: AV {self._fmt_avg(stats['av_avg'])} | "
+                f"SV {self._fmt_avg(stats['sv_avg'])} | Gesamt {self._fmt_avg(stats['gesamt_avg'])} | "
+                f"Vollständigkeit {self._fmt_avg(stats['completion_pct'])}% | Lernende {stats['count']}"
+            )
+        if len(lines) == 2:
+            lines.append("- Keine Jahrgangsdaten")
+        return "\n".join(lines)
+
+    def _render_subject_section(self, current: Dict[str, Any]) -> str:
+        lines = ["Fächerdurchschnitte und Ranking:", ""]
+        ranked = [s for s in current["subject_stats"] if s["gesamt_avg"] is not None]
+        if not ranked:
+            return "\n".join(lines + ["- Keine Fachdaten"])
+
+        lines.append("Beste Fächer (niedrigster Schnitt):")
+        for idx, row in enumerate(ranked[:10], start=1):
+            lines.append(
+                f"- {idx}. {row['subject']}: AV {self._fmt_avg(row['av_avg'])}, "
+                f"SV {self._fmt_avg(row['sv_avg'])}, Gesamt {self._fmt_avg(row['gesamt_avg'])}, "
+                f"Streuung {row['stddev']:.2f}, Noten {row['count']}"
+            )
+
+        lines.append("")
+        lines.append("Schwächste Fächer (höchster Schnitt):")
+        for idx, row in enumerate(list(reversed(ranked[-10:])), start=1):
+            lines.append(
+                f"- {idx}. {row['subject']}: AV {self._fmt_avg(row['av_avg'])}, "
+                f"SV {self._fmt_avg(row['sv_avg'])}, Gesamt {self._fmt_avg(row['gesamt_avg'])}, "
+                f"Streuung {row['stddev']:.2f}, Noten {row['count']}"
+            )
+        return "\n".join(lines)
+
+    def _render_top_section(self, current: Dict[str, Any]) -> str:
+        lines = [
+            "Top Lernende (Mindestkriterium: >=4 benotete Fächer):",
+            "",
+            "Schulweit:",
+        ]
+        if current["top_school"]:
+            for idx, s in enumerate(current["top_school"], start=1):
+                lines.append(
+                    f"- {idx}. {s['name']} ({s['klasse']}): Schnitt {self._fmt_avg(s['gesamt_avg'])}, "
+                    f"AV {self._fmt_avg(s['av_avg'])}, SV {self._fmt_avg(s['sv_avg'])}, Noten {s['notes_total']}"
+                )
+        else:
+            lines.append("- Keine ausreichend bewerteten Lernenden")
+
+        lines.append("")
+        lines.append("Top pro Jahrgang:")
+        for jahrgang, students in current["top_by_year"].items():
+            if students:
+                top = students[0]
+                lines.append(f"- Jg {jahrgang}: {top['name']} ({top['klasse']}) mit {self._fmt_avg(top['gesamt_avg'])}")
+            else:
+                lines.append(f"- Jg {jahrgang}: keine ausreichenden Daten")
+
+        lines.append("")
+        lines.append("Top pro Klasse:")
+        for klasse, students in current["top_by_class"].items():
+            if students:
+                top = students[0]
+                lines.append(f"- {klasse}: {top['name']} mit {self._fmt_avg(top['gesamt_avg'])}")
+            else:
+                lines.append(f"- {klasse}: keine ausreichenden Daten")
+        return "\n".join(lines)
+
+    def _render_trends_section(
+        self, current: Dict[str, Any], compare_datasets: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        compare_datasets = compare_datasets or []
+        if not compare_datasets:
+            return (
+                "Keine Vergleichsperioden ausgewählt.\n\n"
+                "Wählen Sie im Feld „Vergleichsperioden“ eine oder mehrere Perioden "
+                "(Strg+Klick für Mehrfachauswahl) und klicken Sie auf „Analyse aktualisieren“."
+            )
+
+        current_year, current_term = current["period"]
+        lines = [
+            f"Entwicklung der Basisperiode {current_year} (HJ {current_term}) "
+            f"gegen {len(compare_datasets)} ausgewählte Periode(n):",
+            "Hinweis: Deaktivierte Lernende sind ausgeschlossen.",
+            "",
+        ]
+
+        for previous in compare_datasets:
+            prev_year, prev_term = previous["period"]
+            lines.append(f"=== Vergleich mit {prev_year} (HJ {prev_term}) ===")
+
+            current_school = current["school"]
+            prev_school = previous["school"]
+            school_delta = None
+            if current_school.get("gesamt_avg") is not None and prev_school.get("gesamt_avg") is not None:
+                school_delta = current_school["gesamt_avg"] - prev_school["gesamt_avg"]
+            lines.append(
+                f"- Schule gesamt: {self._fmt_avg(prev_school.get('gesamt_avg'))} -> "
+                f"{self._fmt_avg(current_school.get('gesamt_avg'))} (Delta {self._fmt_avg(school_delta)})"
+            )
+            lines.append(
+                f"- Lernende aktiv: {len(previous.get('students', []))} -> "
+                f"{len(current.get('students', []))}"
+            )
+
+            lines.append("")
+            lines.append("Klassenentwicklung:")
+            class_lines = 0
+            for klasse, curr_stats in current["class_stats"].items():
+                prev_stats = previous["class_stats"].get(klasse)
+                if not prev_stats:
+                    continue
+                delta = None
+                if curr_stats.get("gesamt_avg") is not None and prev_stats.get("gesamt_avg") is not None:
+                    delta = curr_stats["gesamt_avg"] - prev_stats["gesamt_avg"]
+                lines.append(
+                    f"  - {klasse}: {self._fmt_avg(prev_stats.get('gesamt_avg'))} -> "
+                    f"{self._fmt_avg(curr_stats.get('gesamt_avg'))} (Delta {self._fmt_avg(delta)})"
+                )
+                class_lines += 1
+            if class_lines == 0:
+                lines.append("  - Keine Klassen mit Daten in beiden Perioden")
+
+            lines.append("")
+            lines.append("Jahrgangsentwicklung:")
+            year_lines = 0
+            for jahrgang, curr_stats in current["year_stats"].items():
+                prev_stats = previous["year_stats"].get(jahrgang)
+                if not prev_stats:
+                    continue
+                delta = None
+                if curr_stats.get("gesamt_avg") is not None and prev_stats.get("gesamt_avg") is not None:
+                    delta = curr_stats["gesamt_avg"] - prev_stats["gesamt_avg"]
+                lines.append(
+                    f"  - Jg {jahrgang}: {self._fmt_avg(prev_stats.get('gesamt_avg'))} -> "
+                    f"{self._fmt_avg(curr_stats.get('gesamt_avg'))} (Delta {self._fmt_avg(delta)})"
+                )
+                year_lines += 1
+            if year_lines == 0:
+                lines.append("  - Keine Jahrgänge mit Daten in beiden Perioden")
+
+            lines.append("")
+            lines.append("Fachentwicklung (Top 10 Deltas):")
+            prev_subject_map = {row["subject"]: row for row in previous["subject_stats"]}
+            deltas = []
+            for row in current["subject_stats"]:
+                prev_row = prev_subject_map.get(row["subject"])
+                if not prev_row:
+                    continue
+                if row["gesamt_avg"] is None or prev_row["gesamt_avg"] is None:
+                    continue
+                deltas.append(
+                    (row["subject"], row["gesamt_avg"] - prev_row["gesamt_avg"], prev_row["gesamt_avg"], row["gesamt_avg"])
+                )
+            if deltas:
+                deltas.sort(key=lambda x: abs(x[1]), reverse=True)
+                for subject, delta, old_val, new_val in deltas[:10]:
+                    lines.append(
+                        f"  - {subject}: {old_val:.2f} -> {new_val:.2f} (Delta {delta:+.2f})"
+                    )
+            else:
+                lines.append("  - Keine vergleichbaren Fachdaten vorhanden")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def _set_insights_text_section(self, section_key: str, text: str):
+        widget = self.insights_text_sections.get(section_key)
+        if not widget:
+            return
+        widget.config(state=tk.NORMAL)
+        widget.delete("1.0", tk.END)
+        widget.insert(tk.END, text)
+        widget.config(state=tk.DISABLED)
+
+    def _set_insights_table_rows(self, section_key: str, rows: List[Tuple[Any, ...]]):
+        tree = self.insights_tables.get(section_key)
+        if not tree:
+            return
+        tree.delete(*tree.get_children())
+        for idx, row in enumerate(rows):
+            tag = "row_even" if idx % 2 == 0 else "row_odd"
+            tree.insert("", tk.END, values=row, tags=(tag,))
+
+    def _set_tree_rows(self, tree, rows: List[Tuple[Any, ...]]):
+        if not tree:
+            return
+        tree.delete(*tree.get_children())
+        for idx, row in enumerate(rows):
+            tag = "row_even" if idx % 2 == 0 else "row_odd"
+            tree.insert("", tk.END, values=row, tags=(tag,))
+
+    def refresh_insights_data(self):
+        """Aktualisiert aggregierte Analysen für die aktive Periode."""
+        if not hasattr(self, "insights_text_sections"):
+            return
+        school_year, term = self._get_active_period()
+        if hasattr(self, "insights_period_label"):
+            self.insights_period_label.config(text=f"Basisperiode: {school_year} (HJ {term})")
+        self._sync_insights_compare_periods(school_year, term)
+
+        if not self.db_path.exists():
+            if hasattr(self, "insights_kpi_vars"):
+                self.insights_kpi_vars["students"].set("0")
+                self.insights_kpi_vars["overall_avg"].set("-")
+                self.insights_kpi_vars["completion"].set("-")
+                self.insights_kpi_vars["classes"].set("0")
+            for key in self.insights_text_sections:
+                self._set_insights_text_section(key, "Keine Datenbank gefunden.")
+            for key in self.insights_tables:
+                self._set_insights_table_rows(key, [])
+            if hasattr(self, "insights_top_tables"):
+                self._set_tree_rows(self.insights_top_tables.get("school"), [])
+                self._set_tree_rows(self.insights_top_tables.get("year"), [])
+                self._set_tree_rows(self.insights_top_tables.get("class"), [])
+            return
+
+        try:
+            current = self._collect_analysis_dataset(school_year, term)
+            compare_datasets = []
+            for cmp_sy, cmp_term in self._get_selected_compare_periods():
+                compare_datasets.append(self._collect_analysis_dataset(cmp_sy, cmp_term))
+
+            if hasattr(self, "insights_kpi_vars"):
+                self.insights_kpi_vars["students"].set(str(len(current.get("students", []))))
+                self.insights_kpi_vars["overall_avg"].set(self._fmt_avg(current.get("school", {}).get("gesamt_avg")))
+                completion = current.get("school", {}).get("completion_pct")
+                completion_text = self._fmt_avg(completion)
+                self.insights_kpi_vars["completion"].set("-" if completion_text == "-" else f"{completion_text}%")
+                self.insights_kpi_vars["classes"].set(str(len(current.get("class_stats", {}))))
+
+            self._set_insights_text_section("overview", self._render_overview_section(current, compare_datasets))
+            self._set_insights_text_section("trends", self._render_trends_section(current, compare_datasets))
+
+            class_rows = []
+            for klasse, stats in sorted(current["class_stats"].items(), key=lambda item: self._class_sort_key(item[0])):
+                class_rows.append(
+                    (
+                        klasse,
+                        self._fmt_avg(stats["av_avg"]),
+                        self._fmt_avg(stats["sv_avg"]),
+                        self._fmt_avg(stats["gesamt_avg"]),
+                        self._fmt_avg(stats["completion_pct"]),
+                        stats["count"],
+                    )
+                )
+            self._set_insights_table_rows("classes", class_rows)
+
+            year_rows = []
+            for jahrgang, stats in sorted(current["year_stats"].items(), key=lambda item: item[0]):
+                year_rows.append(
+                    (
+                        f"Jg {jahrgang}",
+                        self._fmt_avg(stats["av_avg"]),
+                        self._fmt_avg(stats["sv_avg"]),
+                        self._fmt_avg(stats["gesamt_avg"]),
+                        self._fmt_avg(stats["completion_pct"]),
+                        stats["count"],
+                    )
+                )
+            self._set_insights_table_rows("years", year_rows)
+
+            subject_rows = []
+            ranked_subjects = [s for s in current["subject_stats"] if s["gesamt_avg"] is not None]
+            for idx, row in enumerate(ranked_subjects, start=1):
+                subject_rows.append(
+                    (
+                        idx,
+                        row["subject"],
+                        self._fmt_avg(row["av_avg"]),
+                        self._fmt_avg(row["sv_avg"]),
+                        self._fmt_avg(row["gesamt_avg"]),
+                        f"{row['stddev']:.2f}",
+                        row["count"],
+                    )
+                )
+            self._set_insights_table_rows("subjects", subject_rows)
+
+            school_rows = []
+            for idx, s in enumerate(current["top_school"][:10], start=1):
+                av, sv, gesamt, faecher = self._top_student_grade_values(s)
+                school_rows.append(
+                    (self._rank_medal(idx), s["name"], s["klasse"], s["jahrgang"], av, sv, gesamt, faecher)
+                )
+            year_rows_top = []
+            for jahrgang, students in sorted(current["top_by_year"].items(), key=lambda item: item[0]):
+                for idx, s in enumerate(students[:3], start=1):
+                    av, sv, gesamt, faecher = self._top_student_grade_values(s)
+                    year_rows_top.append(
+                        (f"Jg {jahrgang}", self._rank_medal(idx), s["name"], s["klasse"], av, sv, gesamt, faecher)
+                    )
+            class_rows_top = []
+            for klasse in sorted(current["class_stats"].keys(), key=self._class_sort_key):
+                students = current["top_by_class"].get(klasse, [])
+                if students:
+                    s = students[0]
+                    av, sv, gesamt, faecher = self._top_student_grade_values(s)
+                    class_rows_top.append(
+                        (klasse, s["name"], s["jahrgang"], av, sv, gesamt, faecher)
+                    )
+                else:
+                    class_rows_top.append(
+                        (klasse, "— (keine ausreichenden Daten)", "-", "-", "-", "-", "-")
+                    )
+            if hasattr(self, "insights_top_tables"):
+                self._set_tree_rows(self.insights_top_tables.get("school"), school_rows)
+                self._set_tree_rows(self.insights_top_tables.get("year"), year_rows_top)
+                self._set_tree_rows(self.insights_top_tables.get("class"), class_rows_top)
+        except Exception as e:
+            logging.error(f"Fehler beim Aktualisieren der Analysekennzahlen: {e}")
+            if hasattr(self, "insights_kpi_vars"):
+                self.insights_kpi_vars["students"].set("-")
+                self.insights_kpi_vars["overall_avg"].set("-")
+                self.insights_kpi_vars["completion"].set("-")
+                self.insights_kpi_vars["classes"].set("-")
+            for key in self.insights_text_sections:
+                self._set_insights_text_section(key, f"Analyse konnte nicht berechnet werden:\n{e}")
+            for key in self.insights_tables:
+                self._set_insights_table_rows(key, [])
+            if hasattr(self, "insights_top_tables"):
+                self._set_tree_rows(self.insights_top_tables.get("school"), [])
+                self._set_tree_rows(self.insights_top_tables.get("year"), [])
+                self._set_tree_rows(self.insights_top_tables.get("class"), [])
+
     def create_export_tab(self):
         """Erstellt vereinfachten Export-Tab"""
         export_frame = ttk.Frame(self.notebook)
         self.notebook.add(export_frame, text="📤 Export")
+        self.export_tab = export_frame
         # Export-Optionen
         options_frame = ttk.LabelFrame(export_frame, text="Export-Optionen")
         options_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -2959,7 +4386,9 @@ class KopfnotenGUI:
         self.export_progress.pack(fill=tk.X, padx=10, pady=5)
 
     def create_template_tab(self):
-        """Erstellt Template-Tab"""
+        """Erstellt Template-Tab (nur wenn TEMPLATE_MANAGER_ENABLED)."""
+        if not TEMPLATE_MANAGER_ENABLED:
+            return
         template_frame = ttk.Frame(self.notebook)
         self.notebook.add(template_frame, text="📝 Templates")
         # Template-Designer
@@ -3024,7 +4453,7 @@ class KopfnotenGUI:
                 "Template fehlt", "Bitte wählen Sie eine gültige Template-Datei aus."
             )
             # Zur Export-Registerkarte wechseln für Template-Auswahl
-            self.notebook.select(2)
+            self.notebook.select(getattr(self, "export_tab", 3))
             return
 
         # Ausgabeverzeichnis prüfen
@@ -3064,7 +4493,8 @@ class KopfnotenGUI:
     ):
         """Führt Schüler-Export in separatem Thread aus"""
         try:
-            with OptimizedKopfnotenExporter(self.db_path) as exporter:
+            school_year, term = self._get_active_period()
+            with OptimizedKopfnotenExporter(self.db_path, school_year=school_year, term=term) as exporter:
                 start_time = datetime.now()
                 # Export durchführen für einzelnen Schüler
                 summary = exporter.export_horizontal_tables(
@@ -3167,7 +4597,8 @@ class KopfnotenGUI:
     ):
         """Führt optimierten Export aus"""
         try:
-            with OptimizedKopfnotenExporter(self.db_path) as exporter:
+            school_year, term = self._get_active_period()
+            with OptimizedKopfnotenExporter(self.db_path, school_year=school_year, term=term) as exporter:
                 start_time = datetime.now()
                 self.log_to_export(f"Start: {start_time.strftime('%H:%M:%S')}")
 
@@ -3314,6 +4745,8 @@ class KopfnotenGUI:
 
     def refresh_template_list(self):
         """Aktualisiert Template-Liste"""
+        if not TEMPLATE_MANAGER_ENABLED or not hasattr(self, "template_list"):
+            return
         self.template_list.delete(0, tk.END)
         template_dir = self.paths.templates_dir
         if template_dir.exists():
@@ -3338,7 +4771,7 @@ class KopfnotenGUI:
                 "Template gewählt", f"Template ausgewählt: {template_name}"
             )
             # Wechsle zum Export-Tab
-            self.notebook.select(2)
+            self.notebook.select(getattr(self, "export_tab", 3))
 
     # ===================== UTILITY-FUNKTIONEN =====================
 
@@ -3387,6 +4820,9 @@ class KopfnotenGUI:
 
     def import_all_files(self):
         """Importiert alle ausgewählten Excel-Dateien"""
+        if not self._confirm_period_before_import("Excel-Import"):
+            self.status_manager.set_status("Excel-Import abgebrochen")
+            return
         if self.import_listbox.size() == 0:
             messagebox.showwarning(
                 "Keine Dateien", "Bitte wählen Sie zuerst Excel-Dateien aus."
@@ -3403,10 +4839,15 @@ class KopfnotenGUI:
         """Führt Import in separatem Thread aus"""
         try:
             self.path_manager.ensure_directory(self.db_path.parent)
-            with KopfnotenImporter(str(self.db_path)) as importer:
+            school_year, term = self._get_active_period()
+            with KopfnotenImporter(str(self.db_path), school_year=school_year, term=term) as importer:
                 successful = 0
-                for file_path in files:
+                total = len(files)
+                for idx, file_path in enumerate(files, start=1):
                     try:
+                        self.status_manager.set_status(
+                            f"Import läuft: {idx}/{total} - {Path(file_path).name}", True
+                        )
                         self.log_to_import(f"Importiere: {Path(file_path).name}")
                         importer.import_excel_file(file_path)
                         successful += 1
@@ -3473,6 +4914,7 @@ class KopfnotenGUI:
     def export_missing_list(self):
         """Exportiert detaillierte Liste der Schüler mit Status Unvollständig nach Excel"""
         try:
+            school_year, term = self._get_active_period()
             # Output Directory sicherstellen
             output_dir = self.paths.output_excel_dir
             self.path_manager.ensure_directory(output_dir)
@@ -3492,15 +4934,18 @@ class KopfnotenGUI:
                         s.name,
                         s.klasse,
                         s.target_subjects,
-                        COUNT(CASE WHEN n.note_av IS NOT NULL THEN 1 END) AS av_count,
-                        COUNT(CASE WHEN n.note_sv IS NOT NULL THEN 1 END) AS sv_count,
+                        COUNT(CASE WHEN n.note_av IS NOT NULL OR n.note_av_special IS NOT NULL THEN 1 END) AS av_count,
+                        COUNT(CASE WHEN n.note_sv IS NOT NULL OR n.note_sv_special IS NOT NULL THEN 1 END) AS sv_count,
                         COUNT(DISTINCT n.fach_id) AS faecher_count
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
+                        AND n.schuljahr = ?
+                        AND n.halbjahr = ?
+                    WHERE COALESCE(s.is_active, 1) = 1
                     GROUP BY s.schueler_id, s.name, s.klasse, s.target_subjects
                     ORDER BY s.klasse, s.name
                     """
-                ).fetchall()
+                , (school_year, term)).fetchall()
 
                 detail_rows = conn.execute(
                     """
@@ -3510,17 +4955,22 @@ class KopfnotenGUI:
                         COALESCE(f.fach_lang, f.fach_kurz, '') AS fach_name,
                         n.lehrer_kuerzel,
                         n.note_av,
-                        n.note_sv
+                        n.note_sv,
+                        n.note_av_special,
+                        n.note_sv_special
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
+                        AND n.schuljahr = ?
+                        AND n.halbjahr = ?
                     LEFT JOIN faecher f ON n.fach_id = f.fach_id
+                    WHERE COALESCE(s.is_active, 1) = 1
                     ORDER BY s.klasse, s.schueler_id
                     """
-                ).fetchall()
+                , (school_year, term)).fetchall()
 
             subjects_local_map = defaultdict(dict)
             class_subject_teachers = defaultdict(lambda: defaultdict(set))
-            for s_id, klasse, fach_name, lehrer, av, sv in detail_rows:
+            for s_id, klasse, fach_name, lehrer, av, sv, av_special, sv_special in detail_rows:
                 fach = (fach_name or "").strip()
                 if not fach:
                     continue
@@ -3528,10 +4978,17 @@ class KopfnotenGUI:
                     class_subject_teachers[str(klasse)][fach].add(str(lehrer).strip())
                 if fach not in subjects_local_map[s_id]:
                     subjects_local_map[s_id][fach] = {"av": False, "sv": False}
-                if av is not None:
+                if av is not None or av_special is not None:
                     subjects_local_map[s_id][fach]["av"] = True
-                if sv is not None:
+                if sv is not None or sv_special is not None:
                     subjects_local_map[s_id][fach]["sv"] = True
+
+            class_subject_grade_counts = defaultdict(lambda: defaultdict(int))
+            for s_id, name, klasse, target_db, av_count, sv_count, faecher_count in summary_rows:
+                for subj, vals in subjects_local_map.get(s_id, {}).items():
+                    if vals.get("av") or vals.get("sv"):
+                        subj_key = self._normalize_subject_for_sph(subj)
+                        class_subject_grade_counts[str(klasse)][subj_key] += 1
 
             export_rows = []
             sheets_data = defaultdict(list)
@@ -3544,7 +5001,10 @@ class KopfnotenGUI:
                 local_status = self._calculate_status(jahrgang, current_notes, faecher_count or 0, target)
 
                 sph_text, _tag, sph_status_override = self._get_sph_alignment_for_student(
-                    klasse, subjects_local_map.get(s_id, {}), local_status
+                    klasse,
+                    subjects_local_map.get(s_id, {}),
+                    local_status,
+                    dict(class_subject_grade_counts.get(str(klasse), {})),
                 )
                 final_status = sph_status_override if sph_status_override else local_status
 
@@ -3563,13 +5023,7 @@ class KopfnotenGUI:
 
                     teachers = sorted(class_subject_teachers.get(str(klasse), {}).get(fach, set()))
                     teacher_text = ", ".join(teachers) if teachers else "-"
-                    if (not av_ok) and (not sv_ok):
-                        miss = "AV+SV fehlen"
-                    elif not av_ok:
-                        miss = "AV fehlt"
-                    else:
-                        miss = "SV fehlt"
-                    missing_details.append(f"{fach} [{teacher_text}] ({miss})")
+                    missing_details.append(f"{fach} [{teacher_text}]")
 
                 # Fallback falls Status unvollständig ist, aber keine fachscharfen Lücken ermittelt wurden
                 if not missing_details:
@@ -3693,7 +5147,8 @@ class KopfnotenGUI:
             self.refresh_all_data()
         else:
             # Erstellt DB neu
-            with KopfnotenImporter(str(self.db_path)):
+            school_year, term = self._get_active_period()
+            with KopfnotenImporter(str(self.db_path), school_year=school_year, term=term):
                 pass 
             self.log_to_import(
                 "Keine Datenbank gefunden (Neu erstellt). Bitte importieren Sie Daten."
@@ -3705,7 +5160,9 @@ class KopfnotenGUI:
             self.load_classes_for_export()
             self.load_classes_for_analysis()
             self.refresh_analysis_data()
-            self.refresh_template_list()
+            self.refresh_insights_data()
+            if TEMPLATE_MANAGER_ENABLED:
+                self.refresh_template_list()
             self.status_manager.set_status("Daten aktualisiert")
         except Exception as e:
             logging.error(f"Fehler beim Aktualisieren: {e}")
@@ -3716,11 +5173,20 @@ class KopfnotenGUI:
         try:
             if not self.db_path.exists():
                 return
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
-                    "SELECT DISTINCT klasse FROM schueler ORDER BY klasse"
+                    """
+                    SELECT DISTINCT s.klasse
+                    FROM schueler s
+                    JOIN noten n ON s.schueler_id = n.schueler_id
+                    WHERE n.schuljahr = ? AND n.halbjahr = ?
+                      AND COALESCE(s.is_active, 1) = 1
+                    ORDER BY s.klasse
+                    """,
+                    (school_year, term),
                 )
-                classes = [row[0] for row in cursor.fetchall()]
+                classes = sorted([row[0] for row in cursor.fetchall()], key=self._class_sort_key)
                 self.export_listbox.delete(0, tk.END)
                 for class_name in classes:
                     self.export_listbox.insert(tk.END, class_name)
@@ -3733,11 +5199,21 @@ class KopfnotenGUI:
         try:
             if not self.db_path.exists():
                 return
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
-                    "SELECT DISTINCT klasse FROM schueler ORDER BY klasse"
+                    """
+                    SELECT DISTINCT s.klasse
+                    FROM schueler s
+                    JOIN noten n ON s.schueler_id = n.schueler_id
+                    WHERE n.schuljahr = ? AND n.halbjahr = ?
+                      AND COALESCE(s.is_active, 1) = 1
+                    ORDER BY s.klasse
+                    """,
+                    (school_year, term),
                 )
-                classes = ["Alle"] + [row[0] for row in cursor.fetchall()]
+                class_values = sorted([row[0] for row in cursor.fetchall()], key=self._class_sort_key)
+                classes = ["Alle"] + class_values
                 self.class_filter["values"] = classes
                 if classes:
                     self.class_filter.set(classes[0])
@@ -3749,6 +5225,7 @@ class KopfnotenGUI:
         try:
             if not self.db_path.exists():
                 return
+            school_year, term = self._get_active_period()
             self.analysis_tree.delete(*self.analysis_tree.get_children())
             columns = [
                 "ID",
@@ -3780,15 +5257,19 @@ class KopfnotenGUI:
                         s.target_subjects,
                         f.fach_kurz, f.fach_typ, f.fach_lang,
                         n.note_av, n.note_sv,
+                        n.note_av_special, n.note_sv_special,
                         f.ist_wahlpflicht, n.ist_wahlpflicht_belegung,
                         f.wahlpflicht_gruppe,
                         n.lehrer_kuerzel
                     FROM schueler s
                     LEFT JOIN noten n ON s.schueler_id = n.schueler_id
+                        AND n.schuljahr = ?
+                        AND n.halbjahr = ?
                     LEFT JOIN faecher f ON n.fach_id = f.fach_id
+                    WHERE COALESCE(s.is_active, 1) = 1
                     ORDER BY s.klasse, s.name
                 """
-                cursor = conn.execute(query)
+                cursor = conn.execute(query, (school_year, term))
                 rows = cursor.fetchall()
 
                 # 2. Daten nach Schüler gruppieren und deduplizieren
@@ -3801,7 +5282,7 @@ class KopfnotenGUI:
                 class_teacher_map = defaultdict(lambda: defaultdict(set))
                 
                 for row in rows:
-                    s_id, s_name, s_klasse, s_target, f_kurz, f_typ, f_lang, av, sv, f_wp, n_wp, wp_grp, lehrer_kuerzel = row # Adjusted unpacking
+                    s_id, s_name, s_klasse, s_target, f_kurz, f_typ, f_lang, av, sv, av_special, sv_special, f_wp, n_wp, wp_grp, lehrer_kuerzel = row
                     
                     if s_id not in student_map:
                         student_map[s_id] = {
@@ -3839,6 +5320,8 @@ class KopfnotenGUI:
                             "f_typ": f_typ,
                             "av": av,
                             "sv": sv,
+                            "av_special": av_special,
+                            "sv_special": sv_special,
                             "is_wpu": is_wpu,
                             "f_canonical": fach_canonical
                         })
@@ -3877,6 +5360,8 @@ class KopfnotenGUI:
                          f_typ = r["f_typ"]
                          av = r["av"]
                          sv = r["sv"]
+                         av_special = r.get("av_special")
+                         sv_special = r.get("sv_special")
                          is_wpu = r["is_wpu"]
                          f_canonical = r["f_canonical"]
                          
@@ -3888,7 +5373,7 @@ class KopfnotenGUI:
                              # Exclude logic:
                              if f_canonical not in allowed_wpus:
                                  count_subject = False
-                             if av is None and sv is None:
+                             if av is None and sv is None and av_special is None and sv_special is None:
                                  count_subject = False
                          
                          # Name Cleaning für Display (User Request: "Praxistag WU" -> "Praxistag", "Chemie (U1)" -> "Chemie")
@@ -3915,19 +5400,28 @@ class KopfnotenGUI:
                                  # For others: "Deutsch" is "Deutsch".
                                  sm["dedup_subjects"].add(clean_name)
 
-                         # Für SPH-Abgleich: fachnahe Rohbezeichnung pro Lernendem sammeln
-                         local_subject_name = (f_lang or f_kurz or "").strip()
-                         if local_subject_name:
-                             if local_subject_name not in sm["subjects_local"]:
-                                 sm["subjects_local"][local_subject_name] = {"av": False, "sv": False}
-                             if av is not None:
-                                 sm["subjects_local"][local_subject_name]["av"] = True
-                             if sv is not None:
-                                 sm["subjects_local"][local_subject_name]["sv"] = True
+                         # Für SPH-Abgleich: nur gezählte/relevante Fächer (keine ausgeschlossenen WPU-Leichen)
+                         if count_subject:
+                             local_subject_name = (f_lang or f_kurz or "").strip()
+                             if local_subject_name:
+                                 if local_subject_name not in sm["subjects_local"]:
+                                     sm["subjects_local"][local_subject_name] = {"av": False, "sv": False}
+                                 if av is not None or av_special is not None:
+                                     sm["subjects_local"][local_subject_name]["av"] = True
+                                 if sv is not None or sv_special is not None:
+                                     sm["subjects_local"][local_subject_name]["sv"] = True
                          
-                         if av is not None: sm["av_count"] += 1
-                         if sv is not None: sm["sv_count"] += 1
+                         if av is not None or av_special is not None: sm["av_count"] += 1
+                         if sv is not None or sv_special is not None: sm["sv_count"] += 1
                 
+                # Pro Klasse: wie viele Lernende je Fach bereits Noten haben (für SPH-Abgleich)
+                class_subject_grade_counts = defaultdict(lambda: defaultdict(int))
+                for sm in student_map.values():
+                    for subj, vals in sm.get("subjects_local", {}).items():
+                        if vals.get("av") or vals.get("sv"):
+                            subj_key = self._normalize_subject_for_sph(subj)
+                            class_subject_grade_counts[sm["klasse"]][subj_key] += 1
+
                 # In Klassen gruppieren für Referenzwert-Berechnung
                 class_students = defaultdict(list)
                 for sm in student_map.values():
@@ -3938,7 +5432,7 @@ class KopfnotenGUI:
                     class_students[sm["klasse"]].append(sm)
 
                 # 3. Status berechnen und in Treeview einfügen (nach Klasse sortiert)
-                for klasse in sorted(class_students.keys()):
+                for klasse in sorted(class_students.keys(), key=self._class_sort_key):
                     students = class_students[klasse]
                     
                     # Schwellenwert: Maximalanzahl der Noten in dieser Klasse (AV + SV)
@@ -3974,7 +5468,10 @@ class KopfnotenGUI:
                         
                         status = self._calculate_status(jahrgang, current_notes, s["faecher_count"], final_target)
                         sph_alignment, row_tag, sph_status_override = self._get_sph_alignment_for_student(
-                            s["klasse"], s.get("subjects_local", {}), status
+                            s["klasse"],
+                            s.get("subjects_local", {}),
+                            status,
+                            dict(class_subject_grade_counts.get(s["klasse"], {})),
                         )
                         if sph_status_override:
                             status = sph_status_override
@@ -4100,12 +5597,55 @@ class KopfnotenGUI:
             return k.upper()
         return k.upper()
 
-    def _get_sph_alignment_for_student(self, klasse: str, subjects_local: Dict[str, Dict[str, bool]], local_status: str):
+    def _normalize_subject_for_sph(self, text: str) -> str:
+        """Normalisiert Fachbezeichnungen für SPH-Abgleich."""
+        raw = (text or "").strip()
+        if raw in FAECHER_MAPPING:
+            raw = FAECHER_MAPPING[raw]
+        raw = raw.lower()
+        raw = re.sub(r"\b\d{1,2}[a-z]\b", " ", raw)
+        raw = re.sub(r"\bdaz\d+\b", " ", raw)
+        raw = re.sub(r"\(.*?\)", " ", raw)
+        raw = re.sub(r"[^a-z0-9äöüß]+", " ", raw)
+        return re.sub(r"\s+", " ", raw).strip()
+
+    def _subjects_match_for_sph(self, local_subject: str, sph_subject: str) -> bool:
+        a = self._normalize_subject_for_sph(local_subject)
+        b = self._normalize_subject_for_sph(sph_subject)
+        if not a or not b:
+            return False
+        return a == b
+
+    def _find_local_subject_for_sph(
+        self, sph_subject: str, subjects_local: Dict[str, Dict[str, bool]]
+    ):
+        """Findet das lokale Fach, das zu einer SPH-Lerngruppe passt."""
+        for local_subject, vals in subjects_local.items():
+            if self._subjects_match_for_sph(local_subject, sph_subject):
+                return local_subject, vals
+        return None, None
+
+    def _sph_row_is_multi_class(self, row: Dict[str, Any]) -> bool:
+        """True, wenn die SPH-Lerngruppe mehrere Klassen kombiniert (z. B. 05c/05d)."""
+        lerngruppe = row.get("lerngruppe", "") or ""
+        matches = re.findall(r"\b(\d{2}[a-z]|daz\d+)\b", lerngruppe, re.IGNORECASE)
+        return len(matches) > 1
+
+    def _get_sph_alignment_for_student(
+        self,
+        klasse: str,
+        subjects_local: Dict[str, Dict[str, bool]],
+        local_status: str,
+        class_subject_graded: Optional[Dict[str, int]] = None,
+    ):
         """
         SPH-Abgleich je Lernendem.
         Rückgabe: (anzeigetext, row_tag, status_override)
+
+        „Kurs fehlt“ nur, wenn das Fach beim Lernenden gar nicht vorkommt,
+        SPH rot meldet und andere Lernende der Klasse dafür Noten haben.
+        Fehlende Noten bei vorhandenem Fach → „Einzelnoten fehlen“.
         """
-        # Vollständige Lernende bleiben grün (kein klassenweises Rot-Override).
         if local_status == "Vollständig":
             return "SPH: vollständig", "student_green", "Vollständig"
 
@@ -4118,58 +5658,50 @@ class KopfnotenGUI:
         if not rows:
             return "Kein SPH-Abgleich", None, None
 
-        def norm_subject(text: str) -> str:
-            return re.sub(r"\s+", " ", (text or "").strip().lower())
-
-        def subjects_match(local_subject: str, sph_subject: str) -> bool:
-            a = norm_subject(local_subject)
-            b = norm_subject(sph_subject)
-            if not a or not b:
-                return False
-            # Kurze Kürzel nur exakt vergleichen, um Zufallstreffer zu vermeiden.
-            if len(a) < 4 or len(b) < 4:
-                return a == b
-            return a == b or a in b or b in a
-
-        matched_rows = []
-        for row in rows:
-            sph_subject = row.get("fach_raw", "")
-            for local_subject, vals in subjects_local.items():
-                if subjects_match(local_subject, sph_subject):
-                    matched_rows.append((row, vals))
-                    break
-
-        # Kein verwertbarer Fach-Match: lokaler Status bleibt maßgeblich.
-        if not matched_rows:
-            if local_status == "Vollständig":
-                return "SPH: vollständig", "student_green", "Vollständig"
+        student_has_any_grade = any(
+            bool(vals.get("av")) or bool(vals.get("sv")) for vals in subjects_local.values()
+        )
+        if not student_has_any_grade:
             return "SPH: Einzelnoten fehlen", "student_yellow", "Unvollständig"
 
         has_red = False
         has_yellow = False
         has_any_complete = False
+        class_counts = class_subject_graded or {}
+        matched_any = False
 
-        for row, vals in matched_rows:
+        for row in rows:
+            sph_subject = row.get("fach_raw", "")
             color = row.get("farbe")
-            av_ok = bool(vals.get("av"))
-            sv_ok = bool(vals.get("sv"))
-            full_missing = (not av_ok and not sv_ok)
-            partial_missing = (av_ok != sv_ok)
-            complete = (av_ok and sv_ok)
+            local_subject, vals = self._find_local_subject_for_sph(sph_subject, subjects_local)
 
-            if complete:
-                has_any_complete = True
+            if local_subject:
+                matched_any = True
+                av_ok = bool(vals.get("av"))
+                sv_ok = bool(vals.get("sv"))
+                complete = av_ok and sv_ok
+                partial_missing = av_ok != sv_ok
+                full_missing = not av_ok and not sv_ok
 
-            if color == "rot":
-                if full_missing:
-                    has_red = True
-                elif partial_missing:
+                if complete:
+                    has_any_complete = True
+                elif partial_missing or full_missing or color in ("rot", "gelb"):
+                    # Fach ist importiert → fehlende Noten, kein fehlender Kurs.
                     has_yellow = True
-            elif color == "gelb":
-                if full_missing or partial_missing:
-                    has_yellow = True
+                continue
 
-        # Priorität: rot > gelb > grün
+            # Kein lokales Fach: nur dann „Kurs fehlt“ prüfen.
+            if color != "rot" or self._sph_row_is_multi_class(row):
+                continue
+
+            subject_key = self._normalize_subject_for_sph(sph_subject)
+            if class_counts.get(subject_key, 0) > 0:
+                has_red = True
+                matched_any = True
+
+        if not matched_any:
+            return "SPH: Einzelnoten fehlen", "student_yellow", "Unvollständig"
+
         if has_red:
             return "SPH: Kurs fehlt", "student_red", "Unvollständig"
         if has_yellow or local_status == "Unvollständig":
@@ -4242,8 +5774,8 @@ class KopfnotenGUI:
         self.status_filter_var.set("Alle")
         self.refresh_analysis_data()
 
-    def delete_selected_student(self):
-        """Löscht ausgewählten Schüler"""
+    def deactivate_selected_student(self):
+        """Deaktiviert ausgewählten Schüler (persistiert über Re-Importe)."""
         selection = self.analysis_tree.selection()
         if not selection:
             messagebox.showwarning(
@@ -4256,25 +5788,98 @@ class KopfnotenGUI:
         student_name = values[1]
 
         if messagebox.askyesno(
-            "Löschen bestätigen", f"Schüler '{student_name}' wirklich löschen?"
+            "Deaktivierung bestätigen",
+            f"Lernende/r '{student_name}' wird deaktiviert und in Listen/Exporten ausgeblendet.\n\nFortfahren?",
         ):
             try:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.execute(
-                        "DELETE FROM noten WHERE schueler_id = ?", (student_id,)
-                    )
-                    conn.execute(
-                        "DELETE FROM schueler WHERE schueler_id = ?", (student_id,)
+                        "UPDATE schueler SET is_active = 0 WHERE schueler_id = ?",
+                        (student_id,),
                     )
                     conn.commit()
                     messagebox.showinfo(
-                        "Gelöscht", f"Schüler '{student_name}' wurde gelöscht."
+                        "Deaktiviert",
+                        f"Lernende/r '{student_name}' wurde deaktiviert.\n"
+                        "Die Deaktivierung bleibt auch nach Neuimporten erhalten.",
                     )
-                    self.refresh_analysis_data()
-                    self.load_classes_for_export()
+                    self.refresh_all_data()
             except Exception as e:
-                logging.error(f"Fehler beim Löschen: {e}")
-                messagebox.showerror("Lösch-Fehler", f"Fehler: {e}")
+                logging.error(f"Fehler beim Deaktivieren: {e}")
+                messagebox.showerror("Deaktivierungs-Fehler", f"Fehler: {e}")
+
+    def manage_inactive_students(self):
+        """Zeigt deaktivierte Lernende und erlaubt Reaktivierung."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT schueler_id, name, klasse
+                    FROM schueler
+                    WHERE COALESCE(is_active, 1) = 0
+                    ORDER BY klasse, name
+                    """
+                ).fetchall()
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Deaktivierte Lernende konnten nicht geladen werden:\n{e}")
+            return
+
+        if not rows:
+            messagebox.showinfo("Deaktivierte Lernende", "Es sind aktuell keine Lernenden deaktiviert.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Deaktivierte Lernende verwalten")
+        dlg.geometry("520x420")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(
+            dlg,
+            text="Ausgewählte Lernende reaktivieren",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor=tk.W, padx=10, pady=(10, 6))
+
+        frame = ttk.Frame(dlg)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        tree = ttk.Treeview(frame, columns=("id", "name", "klasse"), show="headings")
+        tree.heading("id", text="ID")
+        tree.heading("name", text="Name")
+        tree.heading("klasse", text="Klasse")
+        tree.column("id", width=60, anchor=tk.CENTER)
+        tree.column("name", width=300)
+        tree.column("klasse", width=100, anchor=tk.CENTER)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for sid, name, klasse in rows:
+            tree.insert("", tk.END, values=(sid, name, klasse))
+
+        def reactivate_selected():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Keine Auswahl", "Bitte mindestens eine Person auswählen.")
+                return
+            ids = [tree.item(i)["values"][0] for i in selected]
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.executemany(
+                        "UPDATE schueler SET is_active = 1 WHERE schueler_id = ?",
+                        [(sid,) for sid in ids],
+                    )
+                    conn.commit()
+                dlg.destroy()
+                self.refresh_all_data()
+                messagebox.showinfo("Reaktiviert", f"{len(ids)} Lernende wurden reaktiviert.")
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Reaktivierung fehlgeschlagen:\n{e}")
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Auswahl reaktivieren", command=reactivate_selected).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Schließen", command=dlg.destroy).pack(side=tk.RIGHT)
 
     # ===================== HILFS-FUNKTIONEN =====================
 
@@ -4292,33 +5897,194 @@ class KopfnotenGUI:
                 "Datenbank geöffnet", f"Datenbank geöffnet: {self.db_path.name}"
             )
 
+    def _validate_database_schema(self, db_file: Path) -> Tuple[bool, str]:
+        """Prüft, ob eine Datei eine kompatible SQLite-Datenbank ist."""
+        try:
+            if not db_file.exists() or not db_file.is_file():
+                return False, "Datei wurde nicht gefunden."
+            if db_file.stat().st_size <= 0:
+                return False, "Datei ist leer."
+
+            with sqlite3.connect(str(db_file)) as conn:
+                conn.execute("PRAGMA quick_check")
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+                tables = {row[0] for row in cursor.fetchall()}
+            required = {"schueler", "faecher", "noten"}
+            missing = sorted(required - tables)
+            if missing:
+                return (
+                    False,
+                    "Inkompatible Datenbank. Fehlende Tabellen: " + ", ".join(missing),
+                )
+            return True, ""
+        except sqlite3.Error as e:
+            return False, f"Ungültige SQLite-Datei: {e}"
+        except Exception as e:
+            return False, f"Validierung fehlgeschlagen: {e}"
+
+    def export_database_file(self):
+        """Exportiert die aktive Datenbank als .db-Datei."""
+        if not self.db_path.exists():
+            messagebox.showwarning("Keine Datenbank", "Es gibt keine aktive Datenbank zum Exportieren.")
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{self.db_path.stem}_export_{ts}.db"
+        target = filedialog.asksaveasfilename(
+            title="Datenbank exportieren",
+            defaultextension=".db",
+            initialfile=default_name,
+            filetypes=[("SQLite-Datenbank", "*.db"), ("Alle Dateien", "*.*")],
+            initialdir=str(self.paths.database_path.parent.resolve()),
+        )
+        if not target:
+            return
+
+        target_path = Path(target)
+        if target_path.suffix.lower() != ".db":
+            target_path = target_path.with_suffix(".db")
+        try:
+            self.path_manager.ensure_directory(target_path.parent)
+            shutil.copy2(self.db_path, target_path)
+            self._save_db_transfer_meta(
+                last_export_path=str(target_path),
+                last_export_time=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.status_manager.set_status("Datenbank-Export erfolgreich")
+            messagebox.showinfo(
+                "Export erfolgreich",
+                "Die Datenbank wurde erfolgreich exportiert.\n\n"
+                "Hinweis: Diese Datei kann zentral abgelegt und auf anderen Rechnern importiert werden.\n\n"
+                f"Export-Datei:\n{target_path}",
+            )
+        except Exception as e:
+            messagebox.showerror("Exportfehler", f"Datenbank-Export fehlgeschlagen:\n{e}")
+
+    def import_database_file(self):
+        """Importiert eine .db-Datei und ersetzt die lokale aktive Datenbank."""
+        source = filedialog.askopenfilename(
+            title="Datenbank importieren",
+            filetypes=[("SQLite-Datenbank", "*.db"), ("Alle Dateien", "*.*")],
+            initialdir=str(self.paths.import_dir.resolve()),
+        )
+        if not source:
+            return
+
+        source_path = Path(source)
+        is_valid, reason = self._validate_database_schema(source_path)
+        if not is_valid:
+            messagebox.showerror("Importfehler", reason)
+            return
+
+        proceed = messagebox.askyesno(
+            "Import bestätigen",
+            "Die ausgewählte Datenbank ersetzt die lokale aktive Datenbank vollständig.\n"
+            "Diese Aktion ist für zentrale Ablage und Nutzung auf mehreren Rechnern gedacht.\n\n"
+            "Möchten Sie fortfahren?",
+        )
+        if not proceed:
+            self.status_manager.set_status("Datenbank-Import abgebrochen")
+            return
+
+        target_db = Path(self.paths.database_path)
+        backup_path = None
+        temp_path = target_db.with_suffix(".import_tmp.db")
+
+        try:
+            self.path_manager.ensure_directory(target_db.parent)
+            self.path_manager.ensure_directory(self.paths.backup_dir)
+
+            if target_db.exists():
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = self.paths.backup_dir / f"{target_db.stem}_preimport_{ts}.db"
+                shutil.copy2(target_db, backup_path)
+
+            shutil.copy2(source_path, temp_path)
+            temp_valid, temp_reason = self._validate_database_schema(temp_path)
+            if not temp_valid:
+                raise ValueError(temp_reason)
+
+            os.replace(str(temp_path), str(target_db))
+            self.db_path = target_db
+            self._save_db_transfer_meta(
+                last_import_path=str(source_path),
+                last_import_time=datetime.now().isoformat(timespec="seconds"),
+            )
+            self.load_initial_data()
+            self.refresh_all_data()
+            self.status_manager.set_status("Datenbank-Import erfolgreich")
+            messagebox.showinfo(
+                "Import erfolgreich",
+                f"Datenbank wurde erfolgreich importiert.\n\n"
+                f"Import-Quelle:\n{source_path}\n\n"
+                f"Aktive Datenbank:\n{target_db}\n\n"
+                + (f"Sicherungsdatei: {backup_path}" if backup_path else "Es war keine vorherige Datenbank vorhanden."),
+            )
+        except Exception as e:
+            # Rollback wenn möglich
+            try:
+                if backup_path and backup_path.exists():
+                    shutil.copy2(backup_path, target_db)
+                    self.db_path = target_db
+                    self.load_initial_data()
+            except Exception as rollback_error:
+                logging.error(f"Rollback nach Importfehler fehlgeschlagen: {rollback_error}")
+            messagebox.showerror("Importfehler", f"Datenbank-Import fehlgeschlagen:\n{e}")
+        finally:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+
     def show_database_info(self):
         """Zeigt Datenbank-Informationen"""
         if not self.db_path.exists():
             messagebox.showwarning("Keine Datenbank", "Keine Datenbank gefunden.")
             return
         try:
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 schueler_count = conn.execute(
-                    "SELECT COUNT(*) FROM schueler"
+                    "SELECT COUNT(*) FROM schueler WHERE COALESCE(is_active, 1) = 1"
+                ).fetchone()[0]
+                schueler_inactive_count = conn.execute(
+                    "SELECT COUNT(*) FROM schueler WHERE COALESCE(is_active, 1) = 0"
                 ).fetchone()[0]
                 klassen_count = conn.execute(
-                    "SELECT COUNT(DISTINCT klasse) FROM schueler"
+                    "SELECT COUNT(DISTINCT klasse) FROM schueler WHERE COALESCE(is_active, 1) = 1"
                 ).fetchone()[0]
                 faecher_count = conn.execute("SELECT COUNT(*) FROM faecher").fetchone()[
                     0
                 ]
-                noten_count = conn.execute("SELECT COUNT(*) FROM noten").fetchone()[0]
+                noten_count = conn.execute(
+                    "SELECT COUNT(*) FROM noten WHERE schuljahr = ? AND halbjahr = ?",
+                    (school_year, term),
+                ).fetchone()[0]
                 db_size = self.db_path.stat().st_size / (1024 * 1024)
+                transfer_meta = self._load_db_transfer_meta()
+                last_import_path = transfer_meta.get("last_import_path", "-")
+                last_import_time = transfer_meta.get("last_import_time", "-")
+                last_export_path = transfer_meta.get("last_export_path", "-")
+                last_export_time = transfer_meta.get("last_export_time", "-")
                 info_text = f"""Datenbank-Informationen:
 
 Datei: {self.db_path.name}
 Größe: {db_size:.2f} MB
 Inhalt:
 • Schüler: {schueler_count}
+• Deaktiviert: {schueler_inactive_count}
 • Klassen: {klassen_count}
 • Fächer: {faecher_count}
-• Noten: {noten_count}"""
+• Noten: {noten_count}
+
+Letzte Übertragung:
+• Letzter Import: {last_import_time}
+• Import-Quelle: {last_import_path}
+• Letzter Export: {last_export_time}
+• Export-Ziel: {last_export_path}"""
                 messagebox.showinfo("Datenbank-Info", info_text)
         except Exception as e:
             messagebox.showerror("Datenbankfehler", f"Fehler: {e}")
@@ -4400,11 +6166,13 @@ Inhalt:
 
     def show_about(self):
         """Zeigt Über-Dialog"""
-        about_text = """Kopfnoten-Manager
+        about_text = f"""Kopfnoten-Manager
 
 Entwickelt für IGS in Hessen
 
-© Jörg Pospischil 2025"""
+GitHub: {GITHUB_REPO_URL}
+
+© Jörg Pospischil 2026"""
         messagebox.showinfo("Über", about_text)
         
     def _get_canonical_name(self, f_kurz: str, f_lang: str) -> str:
@@ -4429,6 +6197,7 @@ Entwickelt für IGS in Hessen
     def _get_class_wpu_subjects(self, student_class: str) -> List[Dict]:
         """Holt ALLE WPU-Fächer, die in dieser Klasse existieren"""
         try:
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 # Finde alle Fächer, die eine 'ist_wahlpflicht' Flag oder WPU Gruppe haben
@@ -4445,14 +6214,18 @@ Entwickelt für IGS in Hessen
                         (SELECT lehrer_kuerzel FROM noten n2 
                          JOIN schueler s2 ON n2.schueler_id = s2.schueler_id 
                          WHERE n2.fach_id = f.fach_id AND s2.klasse = ? 
+                           AND n2.schuljahr = ? AND n2.halbjahr = ?
+                          AND COALESCE(s2.is_active, 1) = 1
                          ORDER BY n2.lehrer_kuerzel DESC LIMIT 1) as lehrer_kuerzel
                     FROM faecher f
                     JOIN noten n ON f.fach_id = n.fach_id
                     JOIN schueler s ON n.schueler_id = s.schueler_id
                     WHERE s.klasse = ?
+                    AND n.schuljahr = ? AND n.halbjahr = ?
+                    AND COALESCE(s.is_active, 1) = 1
                     AND (f.ist_wahlpflicht = 1 OR f.wahlpflicht_gruppe LIKE '%WPU%' OR f.wahlpflicht_gruppe LIKE '%WP%')
                     """,
-                    (student_class, student_class),
+                    (student_class, school_year, term, student_class, school_year, term),
                 )
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
@@ -4467,6 +6240,7 @@ Entwickelt für IGS in Hessen
             return {}
             
         try:
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 
@@ -4477,8 +6251,11 @@ Entwickelt für IGS in Hessen
                     JOIN noten n ON f.fach_id = n.fach_id
                     JOIN schueler s ON n.schueler_id = s.schueler_id
                     WHERE s.klasse = ?
+                      AND n.schuljahr = ?
+                      AND n.halbjahr = ?
+                      AND COALESCE(s.is_active, 1) = 1
                 """
-                cursor = conn.execute(query, (student_class,))
+                cursor = conn.execute(query, (student_class, school_year, term))
                 rows = cursor.fetchall()
                 
                 for row in rows:
@@ -4520,6 +6297,7 @@ Entwickelt für IGS in Hessen
             return {}
             
         try:
+            school_year, term = self._get_active_period()
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 # Patterns für Jahrgangssuche (z.B. 9% für 9a, 09% für 09a)
@@ -4533,8 +6311,11 @@ Entwickelt für IGS in Hessen
                     JOIN noten n ON f.fach_id = n.fach_id
                     JOIN schueler s ON n.schueler_id = s.schueler_id
                     WHERE (""" + " OR ".join(["s.klasse LIKE ?"] * len(patterns)) + """)
+                      AND n.schuljahr = ?
+                      AND n.halbjahr = ?
+                      AND COALESCE(s.is_active, 1) = 1
                 """
-                cursor = conn.execute(query, patterns)
+                cursor = conn.execute(query, [*patterns, school_year, term])
                 rows = cursor.fetchall()
                 
                 for row in rows:
@@ -4593,6 +6374,11 @@ PROBLEMLÖSUNG:
 
     def on_closing(self):
         """Behandelt Schließen"""
+        try:
+            self.save_sph_config()
+            self.save_sph_missing_overview()
+        except Exception:
+            pass
         self.root.destroy()
 
 def main():

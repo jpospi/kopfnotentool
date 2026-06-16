@@ -1,6 +1,6 @@
-#define MyAppName "KopfnotenTool"
+﻿#define MyAppName "KopfnotenTool"
 #define MyAppExeName "KopfnotenTool.exe"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 
 [Setup]
 AppId={{A83266D9-97C8-4A6D-BA81-2C188F9099E9}
@@ -27,7 +27,7 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Desktop-Verknüpfung erstellen"; GroupDescription: "Zusätzliche Symbole:"
+Name: "desktopicon"; Description: "Desktop-VerknÃ¼pfung erstellen"; GroupDescription: "ZusÃ¤tzliche Symbole:"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "KopfnotenTool starten"; Flags: nowait postinstall skipifsilent
