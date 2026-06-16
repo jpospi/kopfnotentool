@@ -2,103 +2,133 @@
 
 ## Beschreibung
 
-**KopfnotenTool** ist eine Desktop‑Anwendung zum Import, Verwaltung, Auswertung und Weiterverarbeitung von Kopfnoten aus dem Schulportal Hessen. Es ermöglicht einen manuellen und direkten Import von Excel‑Dateien aus dem SPH, das Analysieren und Bearbeiten von Kopfnoten sowie das Erstellen von Export‑Templates und die Weiterverarbeitung der Noten in Serienbriefen. 
+**KopfnotenTool** ist eine Desktop-Anwendung zum Import, zur Verwaltung, Auswertung und Weiterverarbeitung von Kopfnoten aus dem Schulportal Hessen (SPH). Es unterstützt den automatisierten SPH-Download, den manuellen Excel-Import, die Bearbeitung von Noten, statistische Auswertungen und den Word-/Excel-Export.
+
 Das Tool richtet sich vor allem an Integrierte Gesamtschulen (IGS) in Hessen, die ein Beiblatt zum Zeugnis mit Kopfnoten aller Fächer benötigen.
+
+**Aktuelle Version:** [v1.1.0](https://github.com/jpospi/kopfnotentool/releases/tag/v1.1.0)
 
 ## Hauptfunktionen
 
-1. **SPH‑Login & Excel‑Import**
-   - Direkter Login im Schulportal Hessen (SPH) zum automatisierten Abruf von Kopfnotendaten.
-   - Einlesen von Klassen‑Excel‑Dateien aus dem SPH.
-   - Automatisches Erkennen von Fach‑ und Lehrer‑Informationen.
-   - Speicherung der Daten in einer gesicherten, lokalen SQLite‑Datenbank.
+### Import (Tab „Import“)
 
-2. **Analyse‑Tab**
-   - Anzeige von Lernenden, Klassen und Noten‑Statistiken.
-   - Berechnung des Status **„Vollständig“** oder **„Unvollständig“** für alle Lernenden (basierend auf Fach‑ und Notenzahl).
-   - Identifikation fehlender Noten und Erstellung einer Kontroll‑Lücken‑Liste.
-   - Bearbeiten und Nachtragen von Kopfnoten.
+- **SPH Download & Import** – direkter Login im Schulportal Hessen, automatische Klassenerkennung und Import in die lokale Datenbank
+- **Autoimport bis 9 Züge pro Jahrgang** (Klassen `05a` … `05i`, analog für J6–J10)
+- **Manueller Excel-Import** – lokale SPH-Dateien auswählen und einlesen
+- **Live Import-Log** während SPH-Download und Verarbeitung
+- **Backup-Klassenangaben** (Fallback bei fehlgeschlagener Autoerkennung) unter `Datei → Backup-Klassenangaben…`
 
-3. **Export‑Tab**
-   - Export in Serienbrief/en mit allen Kopfnoten als Klassenssatz.
-   - Export von detaillierten Listen mit fehlenden Noten nach Excel.
-   - Automatisches Anlegen von Klassen‑Sheets und einer Gesamt‑Übersicht.
+### Datenbank (Tab „Datenbank“)
 
-4. **Template‑Designer**
-   - Visueller Designer für Word‑Templates (horizontales 3‑Zeilen‑Layout).
-   - Dynamische Erstellung von Tabellen mit variabler Fach‑Anzahl pro Schüler.
-   - Speicherung als `.docx`‑Datei.
+- Übersicht aller Lernenden mit Filter (Klasse, Name, Lehrkraft, Status)
+- Status **„Vollständig“** / **„Unvollständig“** je Lernendem
+- **SPH-Abgleich** je Lernendem (Ampelfarben und Spalte „SPH-Abgleich“)
+- Noten bearbeiten (Doppelklick), inkl. Sondernoten **GB** und **NF**
+- Lernende **deaktivieren** bzw. deaktivierte Lernende verwalten (bleiben über Re-Import erhalten)
+- **Fehlliste exportieren** (fehlende Fächer inkl. Lehrkräfte)
 
+### Analyse (Tab „Analyse“)
+
+- KPIs: Lernende, Gesamtschnitt, Vollständigkeit, Klassenanzahl
+- Tabellen: Klassen, Jahrgänge, Fächer-Ranking
+- **Top Lernende:** Top 10 Schule, Top 3 je Jahrgang, Klassenbeste je Klasse
+- **Vergleichsperioden** (Mehrfachauswahl) für Entwicklung über Halbjahre hinweg
+- Deaktivierte Lernende sind in allen Kennzahlen ausgeschlossen
+
+### Export (Tab „Export“)
+
+- Serienbrief-Export als Word (`.docx`) mit vorhandener Template-Datei
+- Excel-Export fehlender Noten
+- Template-Auswahl über Dateidialog im Export-Tab (kein separater Template-Manager in der UI)
+
+### Datei-Menü
+
+- Datenbank öffnen, **importieren**, **exportieren**, sichern
+- Backup-Klassenangaben für SPH-Fallback
 
 ## Installation
 
+### Windows (empfohlen)
+
+Fertige Builds stehen als GitHub-Release bereit:
+
+- **Installer:** [KopfnotenTool-Setup.exe](https://github.com/jpospi/kopfnotentool/releases/latest) (empfohlen)
+- **Portable:** `KopfnotenTool.exe` (ohne Installation)
+
+### Aus dem Quellcode
+
 ```bash
-# Repository klonen
 git clone https://github.com/jpospi/kopfnotentool.git
 cd kopfnotentool
 
-# Virtuelle Umgebung erstellen und aktivieren
 python3 -m venv .venv
-source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
 
-# Abhängigkeiten installieren
 pip install -r requirements.txt
-```
-
-## Windows: EXE Build und Installer
-
-```powershell
-# im Projektordner
-.\build_windows.ps1
-```
-
-Danach liegt die EXE unter `dist/KopfnotenTool.exe`.
-
-Für einen Installer:
-
-1. [Inno Setup](https://jrsoftware.org/isdl.php) installieren
-2. `installer/KopfnotenTool.iss` öffnen
-3. Build starten (`Compile`)
-
-Der Installer fragt beim Setup gezielt nach:
-
-- Datenpfad (Basisordner)
-- Standard-Importpfad
-- Word-Exportpfad
-- Excel-Exportpfad
-- Datenbank-Ordner
-- Backup-Ordner für Datenbanksicherungen
-
-Diese Werte werden in `kopfnotentool.paths.json` neben der EXE gespeichert.
-
-## Nutzung
-
-```bash
-# Anwendung starten
 python app.py
 ```
 
-### Schulportal-Login (SPH) und Import
-Das Tool bietet eine integrierte Anbindung an das Schulportal Hessen.
-Sie können sich direkt mit Ihren SPH-Zugangsdaten anmelden.
-Das Passwort wird **nicht** im Klartext gespeichert. Es wird lokal verschlüsselt (via `keyring` und `cryptography`) abgelegt, sodass Sie sich bei jedem Neustart auch offline anmelden können.
-Zum direkt Download der Excel-Listen müssen Sie Tooladmin für das Kopfnotenmodul sein und angeben, wie viele Klassen es pro Jahrgang gibt. Es besteht aber auch die Möglichkeit, die Listen aus dem SPH herunterzuladen und manuell zu importieren.
+## Windows: EXE und Installer selbst bauen
 
+```powershell
+.\build_windows.ps1
+```
 
-### Analyse und Bearbeitung
-Der Analyse-Tab bietet eine zentrale Übersicht über den Status aller eingelesenen Schüler.
-Das System berechnet automatisch, ob ein Schüler "Vollständig" (alle erforderlichen Noten vorhanden) oder "Unvollständig" ist.
-Suchen und Filterfunktionen ermöglichen es Ihnen, gezielt nach unvollständigen Schülern zu suchen und zu filtern.
-Durch Doppelklick auf einen Schüler (Spalte "Fächer") öffnet sich ein Editor, in dem Sie fehlende Noten direkt manuell nachtragen können.
+Ergebnis: `dist\KopfnotenTool.exe`
 
+Installer (Inno Setup 6):
+
+```powershell
+iscc "installer\KopfnotenTool.iss"
+```
+
+Ergebnis: `dist\KopfnotenTool-Setup.exe`
+
+Beim Setup können u. a. konfiguriert werden:
+
+- Datenpfad (Basisordner)
+- Import-, Word- und Excel-Exportpfade
+- Datenbank- und Backup-Ordner
+
+Die Werte werden in `kopfnotentool.paths.json` neben der EXE gespeichert.
+
+## Nutzung
+
+### SPH-Login und Import
+
+1. Tab **Import** öffnen
+2. Bei Bedarf anmelden (`Anmeldung ändern`)
+3. **SPH Download & Import** starten – Klassen werden automatisch erkannt (bis `…i`)
+4. Alternativ: Excel-Dateien manuell auswählen und importieren
+
+Zugangsdaten werden lokal verschlüsselt gespeichert (nicht im Klartext). Für den SPH-Download sind Tooladmin-Rechte im Kopfnotenmodul erforderlich.
+
+### Datenbank und Bearbeitung
+
+- Periode (Schuljahr/Halbjahr) im Tab **Datenbank** wählen
+- Filter nutzen oder Doppelklick auf **Fächer** zum Noten-Editor
+- Tab **Analyse** für Statistiken und Rankings
+
+### Word-Export
+
+Im Tab **Export** eine bestehende `.docx`-Template-Datei auswählen. Ein visueller Template-Designer ist in v1.1.0 **deaktiviert** (Code bleibt im Projekt für spätere Wiederaufnahme).
 
 ## Konfiguration
 
-- Laufzeitpfade werden über `kopfnotentool.paths.json` gesteuert.
-- Eine Beispielkonfiguration liegt in `kopfnotentool.paths.example.json`.
-- Wichtige Pfade: Import, Word-/Excel-Export, Datenbankpfad, Backup-Ordner, Template-/Log-/Temp-Verzeichnisse.
-- Im Menü `Datei` gibt es den Punkt **Datenbank sichern** (Backup in den konfigurierten Backup-Ordner).
+- Laufzeitpfade: `kopfnotentool.paths.json`
+- Beispiel: `kopfnotentool.paths.example.json`
+- SPH-Konfiguration und Backup-Klassen: `sph_config.json` (Datenordner)
+
+## Hinweise zur Version 1.1.0
+
+- Neuer **Analyse-Tab** mit KPIs, Rankings und Periodenvergleich
+- Import-UI: SPH oben, manueller Import kompakt unten
+- SPH-Abgleich pro Lernendem (nicht klassenweise)
+- Datenbank-Import/-Export über das Datei-Menü
+- Autoimport für **neunzügige Jahrgänge** (a–i)
+- Template-Manager/Designer in der Oberfläche **vorübergehend deaktiviert**
 
 ## Lizenz
 
-Dieses Projekt ist unter der **MIT‑Lizenz** veröffentlicht (siehe `LICENSE`).
+Dieses Projekt ist unter der **MIT-Lizenz** veröffentlicht (siehe `LICENSE`).
